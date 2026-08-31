@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .env
 venv/
+cache/
+data/
+.ipynb_checkpoints/
+*.parquet
+fundamendals_repair_08-2026/
