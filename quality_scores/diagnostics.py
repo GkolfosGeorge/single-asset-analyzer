@@ -1,8 +1,8 @@
 """
-diagnostics.py — recurring checks for the quality scores. Read-only: nothing
-here writes to the database.
+diagnostics.py — recurring checks for the quality scores and the data under
+them. Read-only: nothing here writes to the database.
 
-Two questions, asked after every change to line_items.py, piotroski.py or
+Three questions, asked after every change to line_items.py, piotroski.py or
 the ingest:
 
 1. Regression — did a code change alter any score it should not have?
@@ -11,6 +11,10 @@ the ingest:
 
 2. Coverage — for what share of the universe is each criterion N/A?
    coverage_report() + na_rates() / na_by_sector().
+
+3. Integrity — is the fundamentals table internally consistent?
+   integrity_report(). Run after every weekly ingest. Checks (b) and (c)
+   must be 0; (a) is informational (late filers, amendments).
 """
 from __future__ import annotations
 
@@ -104,3 +108,64 @@ def na_by_sector(cov: pd.DataFrame,
     out = (cov[list(cols)].isna().groupby(sectors).mean() * 100).round(0)
     out.insert(0, "companies", cov.groupby(sectors).size())
     return out.sort_values(cols[0], ascending=False)
+
+
+# ── Integrity ───────────────────────────────────────────────────────────────
+# Oct 2026: comparative columns (same quarter last year, prior year-end
+# balance sheet) were stored under the current filing's fy/fp label for
+# ~165k rows, unnoticed for two months because annual data -- all that
+# Piotroski reads -- was fine. These checks would have caught it on day one.
+INTEGRITY_SKIP = ("PARA", "XOM")   # two CIKs on one ticker -- known, unrepaired
+
+
+def integrity_report(engine, skip=INTEGRITY_SKIP) -> dict:
+    """
+    (a) rows filed > 300 days after their period ended, by form.
+        Informational: late filers (e.g. SMCI 2019) and amendments land here
+        legitimately. Baseline Oct 2026: 10-Q 288 rows / 3 tickers,
+        10-K 85 / 2. A jump to thousands = something changed.
+    (b) the same (ticker, metric, form, period_end) under 2+ fiscal years.
+        Must be 0: one period, one row.
+    (c) one value + one period_end under 3+ different (fiscal_year, fiscal_period).
+        Must be 0: the "CTL pattern" -- a year-end balance copied into the
+        next three quarters.
+    Only metrics the parser owns (XBRL_TAG_MAP) are checked; legacy rows
+    from the pre-built DB are out of scope.
+    """
+    from sqlalchemy import text
+    from fundamentals import XBRL_TAG_MAP
+
+    p = {"canon": list(XBRL_TAG_MAP), "skip": list(skip)}
+    base = """FROM fundamentals f
+              JOIN metric_lookup m     ON m.id  = f.metric_id
+              JOIN form_type_lookup ft ON ft.id = f.form_type_id
+              WHERE m.name = ANY(:canon) AND NOT (f.ticker = ANY(:skip))"""
+
+    with engine.connect() as c:
+        late = pd.read_sql(text(f"""
+            SELECT ft.name AS form, COUNT(*) AS rows, COUNT(DISTINCT f.ticker) AS tickers
+            {base} AND f.filed_date - f.period_end > 300
+            GROUP BY 1 ORDER BY 2 DESC"""), c, params=p)
+        dup = c.execute(text(f"""
+            SELECT COUNT(*), COUNT(DISTINCT ticker) FROM (
+                SELECT f.ticker, f.metric_id, f.form_type_id, f.period_end
+                {base} AND f.period_start IS NOT NULL
+                GROUP BY 1, 2, 3, 4 HAVING COUNT(DISTINCT f.fiscal_year) > 1) x"""), p).fetchone()
+        copied = c.execute(text(f"""
+            SELECT COUNT(*), COUNT(DISTINCT ticker) FROM (
+                SELECT f.ticker, f.metric_id, f.period_end, f.value
+                {base} AND ft.name IN ('10-Q', '10-K')
+                GROUP BY 1, 2, 3, 4
+                HAVING COUNT(DISTINCT (f.fiscal_year, f.fiscal_period)) >= 3) x"""), p).fetchone()
+        size = c.execute(text(
+            "SELECT pg_size_pretty(pg_database_size(current_database()))")).scalar()
+
+    ok = dup[0] == 0 and copied[0] == 0
+    print("── Integrity ─────────────────────────────────")
+    print("(a) lag > 300 μέρες (πληροφοριακό):")
+    print(late.to_string(index=False) if len(late) else "    0")
+    print(f"(b) ίδια περίοδος, δύο fiscal_year : {dup[0]:,} σε {dup[1]} tickers")
+    print(f"(c) ίδια τιμή σε 3+ περιόδους      : {copied[0]:,} σε {copied[1]} tickers")
+    print(f"μέγεθος βάσης: {size}  (όριο Neon free tier: 512 MB)")
+    print("✅ OK" if ok else "❌ ΠΡΟΣΟΧΗ — (b) ή (c) ≠ 0: σταμάτα και ψάξε πριν εμπιστευτείς τα P/E")
+    return {"late": late, "dup": dup, "copied": copied, "size": size, "ok": ok}
