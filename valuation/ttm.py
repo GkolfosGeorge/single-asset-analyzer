@@ -41,6 +41,7 @@ NINE_M_DAYS = (260, 290)      # 9-month year-to-date
 YEAR_DAYS = (350, 380)        # 52/53-week or calendar year
 DAYS_PER_QUARTER = 91.3
 MAX_TTM_AGE_DAYS = 270        # newest TTM older than this → company stopped filing
+SCALE_ERROR_X = 50            # share count ×50 away from its neighbours → unit error, dropped
 
 COLS = ["period_start", "period_end", "filed_date", "value"]
 
@@ -270,9 +271,45 @@ def build_latest(rows: pd.DataFrame, splits: pd.Series | None = None,
             | ((df["form_type"] == "10-Q") & dur.between(*QUARTER_DAYS))
             | ((df["form_type"] == "10-K") & dur.between(*YEAR_DAYS)))
     df = df[keep].sort_values("filed_date").drop_duplicates("period_end")
+    dropped = pd.DataFrame()
+    if shares and len(df) >= 3:
+        # Scale errors: a filer occasionally tags shares in thousands instead of
+        # units (KO 2018: ~4.3 million instead of ~4.3 billion). A real share
+        # count never moves ×50 between nearby periods once splits are adjusted.
+        df = df.sort_values("period_end")
+        med = df["value"].rolling(9, center=True, min_periods=3).median()
+        ratio = df["value"] / med
+        bad = (ratio > SCALE_ERROR_X) | (ratio < 1 / SCALE_ERROR_X)
+        dropped, df = df[bad], df[~bad]
     out = df.rename(columns={"filed_date": "available", "value": value_col})[cols].copy()
     out["available"] = out["available"] + timedelta(days=1)
-    return newest_only(out)
+    out = newest_only(out)
+    # for debug: rows rejected as scale errors (plain records — a DataFrame
+    # inside .attrs breaks later pandas merges that compare attrs)
+    out.attrs["dropped"] = (dropped[["period_end", "filed_date", "value"]].to_dict("records")
+                            if len(dropped) else [])
+    return out
+
+
+def yoy_change(frame: pd.DataFrame, col: str) -> pd.DataFrame:
+    """
+    Per period: value one year EARLIER / value now − 1, comparing PERIODS
+    (period_end 330–400 days apart), not calendar days — otherwise filings
+    a few days apart from one year to the next create one-day spikes.
+    Columns: period_end, available, chg.  Shares 100 → 97: chg = +3.1%.
+    """
+    cols = ["period_end", "available", "chg"]
+    if frame.empty:
+        return pd.DataFrame(columns=cols)
+    f = frame.sort_values("period_end").reset_index(drop=True)
+    out = []
+    for _, r in f.iterrows():
+        gap = (r["period_end"] - f["period_end"]).dt.days
+        prev = f[(gap >= 330) & (gap <= 400)]
+        if len(prev) and r[col]:
+            out.append({"period_end": r["period_end"], "available": r["available"],
+                        "chg": prev[col].iloc[-1] / r[col] - 1})
+    return pd.DataFrame(out, columns=cols)
 
 
 def asof_daily(dates, frame: pd.DataFrame, col: str,

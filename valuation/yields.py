@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from .ttm import (MAX_TTM_AGE_DAYS, _build_quarters, _fmt, asof_daily, build_latest,
-                  build_ttm, load_metric, load_prices, newest_only)
+                  build_ttm, load_metric, load_prices, newest_only, yoy_change)
 
 CFO = "NetCashProvidedByUsedInOperatingActivities"
 CAPEX = "PaymentsToAcquirePropertyPlantAndEquipment"
@@ -97,6 +97,8 @@ def fcf_history(ticker: str, engine, years: int = 10, as_of=None) -> FCFHistory:
     shares = build_latest(rows[SHARES], sp, shares=True, value_col="shares")
     fcf = fcf_ttm(rows[CFO], rows[CAPEX])
     d = build_daily(close[ticker], shares, fcf)
+    # positive = fewer shares than one year earlier (period vs period)
+    d["share_change_12m"] = asof_daily(d.index, yoy_change(shares, "shares"), "chg").to_numpy()
     d = d[(d.index >= start) & (d.index <= end)]
 
     if rows[CAPEX].empty:
@@ -166,6 +168,10 @@ def debug_fcf(ticker: str, engine, n: int = 5) -> None:
 
     shares = build_latest(load_metric(SHARES, [ticker], engine), sp, shares=True, value_col="shares")
     print(f"\n── {ticker} μετοχές (diluted, μέσος όρος περιόδου, σε σημερινές μετοχές) ──")
+    bad = pd.DataFrame(shares.attrs.get("dropped", []))
+    if len(bad):
+        print(f"  ⚠️ απορρίφθηκαν {len(bad)} γραμμές ως λάθος κλίμακας (π.χ. χιλιάδες αντί για μονάδες):")
+        print(bad[["period_end", "filed_date", "value"]].to_string(index=False))
     if not shares.empty:
         s = shares.tail(3).copy()
         s["shares"] = (s["shares"] / 1e6).map("{:,.0f}M".format)
