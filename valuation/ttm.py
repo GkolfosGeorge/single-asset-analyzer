@@ -235,6 +235,65 @@ def build_ttm(rows: pd.DataFrame, splits: pd.Series | None = None,
     return out.reset_index(drop=True)
 
 
+def newest_only(out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rows with `available` and `period_end`: keep a row only if its period is
+    newer than everything known before it (a late filing for an OLD period
+    must not replace a newer one on the timeline).
+    """
+    out = out.sort_values(["available", "period_end"]).reset_index(drop=True)
+    newest_before = out["period_end"].cummax().shift()
+    return out[newest_before.isna() | (out["period_end"] > newest_before)].reset_index(drop=True)
+
+
+def build_latest(rows: pd.DataFrame, splits: pd.Series | None = None,
+                 shares: bool = False, value_col: str = "value") -> pd.DataFrame:
+    """
+    "Latest known value" series for metrics that must NOT be summed:
+    balance-sheet items (debt, cash — `instant`, no period_start) and
+    average share counts (one quarter or one year, never 6M/9M YTD).
+
+    shares=True: share counts go the OPPOSITE way of EPS on a split —
+    they are MULTIPLIED by later splits (AAPL FY2019: 4.65 bn × 4 = 18.6 bn
+    in today's shares), so that  split-adjusted price × shares = market cap.
+
+    Columns: period_end, available (filed + 1 day), <value_col>.
+    """
+    cols = ["period_end", "available", value_col]
+    df = rows.dropna(subset=["value", "period_end", "filed_date"]).copy()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    if shares and splits is not None and len(splits):
+        df["value"] = df["value"] * splits_after(splits, df["filed_date"])
+    dur = (df["period_end"] - df["period_start"]).dt.days
+    keep = (df["period_start"].isna()
+            | ((df["form_type"] == "10-Q") & dur.between(*QUARTER_DAYS))
+            | ((df["form_type"] == "10-K") & dur.between(*YEAR_DAYS)))
+    df = df[keep].sort_values("filed_date").drop_duplicates("period_end")
+    out = df.rename(columns={"filed_date": "available", "value": value_col})[cols].copy()
+    out["available"] = out["available"] + timedelta(days=1)
+    return newest_only(out)
+
+
+def asof_daily(dates, frame: pd.DataFrame, col: str,
+               max_age_days: int = MAX_TTM_AGE_DAYS) -> pd.Series:
+    """
+    For each day: the value of `col` known that day (available ≤ day), or
+    NaN if its period ended more than `max_age_days` ago (company stopped
+    filing). Same rule as daily_pe, for any series.
+    """
+    idx = pd.DatetimeIndex(dates)
+    if frame.empty:
+        return pd.Series(np.nan, index=idx)
+    left = pd.DataFrame({"date": idx.as_unit("ns")})
+    right = frame.sort_values("available")[["available", "period_end", col]].copy()
+    for c in ("available", "period_end"):
+        right[c] = pd.to_datetime(right[c]).dt.as_unit("ns")
+    m = pd.merge_asof(left, right, left_on="date", right_on="available", direction="backward")
+    stale = (m["date"] - m["period_end"]).dt.days > max_age_days
+    return pd.Series(m[col].where(~stale).to_numpy(dtype=float), index=idx)
+
+
 def debug_ttm(ticker: str, engine, metric: str, per_share: bool = False,
               since: str = "2024-01-01", max_age_days: int = MAX_TTM_AGE_DAYS) -> None:
     """
