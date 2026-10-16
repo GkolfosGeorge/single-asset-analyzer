@@ -24,6 +24,7 @@ Three traps this module exists to avoid:
    quarterly EPS don't add up exactly — standard industry practice.)
 
 TTM ("trailing twelve months") EPS = sum of the last 4 discrete quarters.
+The generic TTM logic (any metric, YTD → quarters) lives in ttm.py.
 
 Peers: every ticker in the fundamentals universe with the same yfinance
 `sector` (or `industry`). Peer P/E per day = MEDIAN of peers with
@@ -42,9 +43,10 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
+from . import ttm as _ttm
+from .ttm import QUARTER_DAYS, YEAR_DAYS, load_metric, load_prices, splits_after  # noqa: F401
+
 EPS_METRIC = "EarningsPerShareDiluted"
-QUARTER_DAYS = (80, 100)      # a fiscal quarter is 13 weeks (~91 days)
-YEAR_DAYS = (350, 380)        # 52/53-week or calendar year
 MAX_EPS_AGE_DAYS = 270        # newest TTM older than this → company stopped filing → no P/E
 SPLIT_LOOKBACK_DAYS = 500     # download prices/splits this far before the chart start
 MIN_PEERS = 5                 # below this, a "sector median" is not meaningful
@@ -69,57 +71,7 @@ def load_universe(engine) -> list[str]:
 
 def load_eps(tickers: list[str], engine, as_of=None) -> pd.DataFrame:
     """Diluted EPS rows (original 10-Q/10-K only) for many tickers, ONE query."""
-    where = ["m.name = :metric", "f.ticker = ANY(:tickers)", "ft.name IN ('10-Q', '10-K')"]
-    params = {"metric": EPS_METRIC, "tickers": list(tickers)}
-    if as_of:
-        where.append("f.filed_date <= CAST(:as_of AS DATE)")
-        params["as_of"] = str(as_of)
-
-    sql = text(f"""
-        SELECT f.ticker, f.value, f.period_start, f.period_end, f.filed_date,
-               ft.name AS form_type
-        FROM fundamentals f
-        JOIN metric_lookup m     ON m.id  = f.metric_id
-        JOIN form_type_lookup ft ON ft.id = f.form_type_id
-        WHERE {' AND '.join(where)}
-    """)
-    with engine.connect() as conn:
-        rows = conn.execute(sql, params).fetchall()
-
-    df = pd.DataFrame(rows, columns=["ticker", "value", "period_start",
-                                     "period_end", "filed_date", "form_type"])
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    for c in ("period_start", "period_end", "filed_date"):
-        df[c] = pd.to_datetime(df[c])
-    return df
-
-
-def load_prices(tickers: list[str], start, end=None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns (close, splits), both DataFrames indexed by date, one column per
-    ticker. close = split-adjusted, NOT dividend-adjusted. splits = ratio on
-    the split day (4.0 for 4:1, 0.1 for a 1:10 reverse split), 0 otherwise.
-    """
-    import yfinance as yf
-
-    raw = yf.download(list(tickers), start=str(start), end=None if end is None else str(end),
-                      auto_adjust=False, actions=True, progress=False, threads=True)
-    if raw is None or raw.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    def _field(name):
-        if isinstance(raw.columns, pd.MultiIndex):
-            if name not in raw.columns.get_level_values(0):
-                return pd.DataFrame(0.0, index=raw.index, columns=list(tickers))
-            out = raw[name]
-        else:  # very old yfinance: single ticker → flat columns
-            out = raw[[name]].rename(columns={name: tickers[0]})
-        return out
-
-    close, splits = _field("Close"), _field("Stock Splits").fillna(0.0)
-    for df in (close, splits):
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-    return close, splits
+    return load_metric(EPS_METRIC, tickers, engine, as_of=as_of)
 
 
 def _fetch_one_classification(yf, t: str, retries: int = 1) -> dict | None:
@@ -200,140 +152,22 @@ def get_classification(tickers: list[str], cache_path: str = "data/classificatio
 # 2. PURE LOGIC (no DB, no network — testable with synthetic data)
 # ═════════════════════════════════════════════════════════════════════════
 
-def splits_after(splits: pd.Series, dates: pd.Series) -> np.ndarray:
-    """For each date d: product of split ratios on days STRICTLY after d."""
-    s = splits[splits > 0]
-    if s.empty:
-        return np.ones(len(dates))
-    return np.array([s[s.index > d].prod() for d in dates], dtype=float)
-
+# The TTM machinery lives in ttm.py (shared by every metric). These thin
+# wrappers keep the EPS-specific names that the notebook and pe_plots use.
 
 def _build_quarters(eps: pd.DataFrame, splits: pd.Series | None = None):
-    """
-    Returns (q, fy, quarters, q4_log):
-      q        — discrete 10-Q quarters (split-adjusted)
-      fy       — full-year 10-K rows (split-adjusted)
-      quarters — q + derived Q4s, sorted
-      q4_log   — one line per FY explaining whether its Q4 could be derived
-    """
-    df = eps.dropna(subset=["value", "period_start", "period_end", "filed_date"]).copy()
-    empty = pd.DataFrame(columns=["period_start", "period_end", "filed_date", "value"])
-    if df.empty:
-        return empty, empty, empty, []
-
-    # (a) split-adjust EVERY row with the splits after ITS OWN filing date,
-    #     before any adding/subtracting — Q1–Q3 and FY may straddle a split.
-    if splits is not None and len(splits):
-        df["value"] = df["value"] / splits_after(splits, df["filed_date"])
-
-    dur = (df["period_end"] - df["period_start"]).dt.days
-    q = df[(df["form_type"] == "10-Q") & dur.between(*QUARTER_DAYS)]
-    fy = df[(df["form_type"] == "10-K") & dur.between(*YEAR_DAYS)]
-    # Same period reported under two fiscal labels → keep the first filing.
-    q = q.sort_values("filed_date").drop_duplicates("period_end")
-    fy = fy.sort_values("filed_date").drop_duplicates("period_end")
-
-    # (b) derive Q4 = FY − (Q1+Q2+Q3)
-    q4_rows, log = [], []
-    for _, y in fy.iterrows():
-        inside = q[(q["period_start"] >= y["period_start"] - timedelta(days=10)) &
-                   (q["period_end"] <= y["period_end"] - timedelta(days=60))]
-        tag = f"FY {y['period_start']:%Y-%m-%d}→{y['period_end']:%Y-%m-%d}"
-        if len(inside) != 3:
-            log.append(f"{tag}: ✗ βρέθηκαν {len(inside)} τρίμηνα μέσα στη χρονιά (θέλουμε 3)")
-            continue
-        q4_start = inside["period_end"].max() + timedelta(days=1)
-        q4_days = (y["period_end"] - q4_start).days
-        if not QUARTER_DAYS[0] <= q4_days <= QUARTER_DAYS[1]:
-            log.append(f"{tag}: ✗ Q4 θα είχε {q4_days} μέρες")
-            continue
-        q4_val = y["value"] - inside["value"].sum()
-        log.append(f"{tag}: ✓ Q4 = {y['value']:.2f} − {inside['value'].sum():.2f} = {q4_val:.2f}")
-        q4_rows.append({"period_start": q4_start, "period_end": y["period_end"],
-                        "filed_date": y["filed_date"], "value": q4_val})
-    quarters = pd.concat([q[["period_start", "period_end", "filed_date", "value"]],
-                          pd.DataFrame(q4_rows, columns=empty.columns)], ignore_index=True)
-    quarters = quarters.sort_values("period_end").drop_duplicates("period_end").reset_index(drop=True)
-    return q, fy, quarters, log
+    return _ttm._build_quarters(eps, splits, per_share=True)
 
 
 def build_ttm(eps: pd.DataFrame, splits: pd.Series | None = None) -> pd.DataFrame:
-    """
-    One ticker's EPS rows → TTM EPS series, columns:
-        period_end  — end of the latest quarter in the TTM window
-        available   — first day the market could use it (last filing + 1 day)
-        eps_ttm     — in TODAY's share units (split-adjusted)
-    """
-    cols = ["period_end", "available", "eps_ttm"]
-    q, fy, quarters, _ = _build_quarters(eps, splits)
-    if fy.empty and quarters.empty:
-        return pd.DataFrame(columns=cols)
-
-    # (c) TTM = last 4 quarters, only if they are truly consecutive
-    ttm = []
-    for i in range(3, len(quarters)):
-        w = quarters.iloc[i - 3:i + 1]
-        span = (w["period_end"].iloc[-1] - w["period_start"].iloc[0]).days
-        gaps = w["period_end"].diff().dt.days.iloc[1:]
-        if YEAR_DAYS[0] <= span <= YEAR_DAYS[1] and gaps.between(*QUARTER_DAYS).all():
-            ttm.append({"period_end": w["period_end"].iloc[-1],
-                        "available": w["filed_date"].max(),
-                        "eps_ttm": w["value"].sum()})
-    # A full-year 10-K IS a TTM by itself (covers companies with no 10-Q data).
-    fy_ttm = fy.rename(columns={"filed_date": "available", "value": "eps_ttm"})[cols]
-    out = pd.concat([fy_ttm, pd.DataFrame(ttm, columns=cols)], ignore_index=True)
-    out = out.drop_duplicates("period_end", keep="first")      # FY wins on ties: exact, no Q4 math
-    out["available"] = out["available"] + timedelta(days=1)    # filed after the close → usable next day
-
-    # (d) on any day, use the NEWEST period known by then (a late filing for
-    #     an older period must not replace a newer one)
-    out = out.sort_values(["available", "period_end"]).reset_index(drop=True)
-    newest_before = out["period_end"].cummax().shift()
-    out = out[newest_before.isna() | (out["period_end"] > newest_before)]
-    return out.reset_index(drop=True)
+    """One ticker's EPS rows → columns period_end, available, eps_ttm (today's share units)."""
+    return _ttm.build_ttm(eps, splits, per_share=True, value_col="eps_ttm")
 
 
 def debug_ttm(ticker: str, engine, since: str = "2024-01-01") -> None:
-    """
-    Show, step by step, how one ticker's TTM EPS is built — raw DB rows,
-    Q4 derivation, final TTM — exactly as pe_history() builds it, i.e.
-    WITH split adjustment (EPS in today's share units).
-    Use it on peers flagged "παλιό EPS" or on any P/E that looks odd.
-    """
-    eps = load_eps([ticker], engine)
-    if eps.empty:
-        print(f"{ticker}: καμία γραμμή {EPS_METRIC} στη βάση.")
-        return
-    eps = eps.sort_values("period_end")
-    eps["days"] = (eps["period_end"] - eps["period_start"]).dt.days
-    recent = eps[eps["period_end"] >= since]
-    print(f"── {ticker}: γραμμές EPS στη βάση από {since} (όπως κατατέθηκαν, χωρίς split) ──")
-    print(recent[["form_type", "period_start", "period_end", "days", "filed_date", "value"]]
-          .to_string(index=False) if not recent.empty else "  (καμία)")
-    print(f"  (σύνολο στη βάση: {len(eps)} γραμμές, τελευταίο filed {eps['filed_date'].max():%Y-%m-%d})")
-
-    sp = None
-    try:
-        _, splits = load_prices([ticker], eps["filed_date"].min().date())
-        if ticker in splits.columns:
-            sp = splits[ticker]
-            done = sp[sp > 0]
-            if len(done):
-                print("  splits: " + ", ".join(f"{d:%Y-%m-%d} ×{r:g}" for d, r in done.items())
-                      + "  → οι τιμές παρακάτω είναι σε ΣΗΜΕΡΙΝΕΣ μετοχές")
-    except Exception as e:
-        print(f"  ⚠️ splits δεν κατέβηκαν ({e}) — οι τιμές παρακάτω ΔΕΝ είναι προσαρμοσμένες")
-
-    _, _, quarters, log = _build_quarters(eps, sp)
-    print("\n── Παραγωγή Q4 ──")
-    for line in log[-4:]:
-        print("  " + line)
-    ttm = build_ttm(eps, sp)
-    print("\n── Τελευταία TTM ──")
-    print(ttm.tail(4).to_string(index=False) if not ttm.empty else "  (κανένα)")
-    if not ttm.empty:
-        age = (pd.Timestamp(date.today()) - ttm["period_end"].iloc[-1]).days
-        print(f"  Ηλικία τελευταίου TTM: {age} μέρες (όριο {MAX_EPS_AGE_DAYS})")
+    """Step-by-step TTM EPS for one ticker, WITH split adjustment (as the charts use it)."""
+    _ttm.debug_ttm(ticker, engine, EPS_METRIC, per_share=True, since=since,
+                   max_age_days=MAX_EPS_AGE_DAYS)
 
 
 def daily_pe(close: pd.Series, ttm: pd.DataFrame) -> pd.DataFrame:
