@@ -35,9 +35,15 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
-QUARTER_DAYS = (80, 100)      # a fiscal quarter is 13 weeks (~91 days)
-H1_DAYS = (170, 200)          # 6-month year-to-date
-NINE_M_DAYS = (260, 290)      # 9-month year-to-date
+# Period lengths, in days. Most companies use 13-week quarters (~91 days),
+# but many retailers and food companies use a 12-12-12-16 week calendar:
+#   Kroger, Advance Auto Parts: Q1 = 16 weeks (112 days), then 12, 12, 12
+#   AutoZone: Q3 = 16 weeks;  PepsiCo, Domino's: Q4 = 16 weeks
+# So a quarter is 12–16 weeks, and the year-to-date windows widen to match.
+# The four ranges must never overlap (115 < 160, 200 < 245, 295 < 350).
+QUARTER_DAYS = (80, 115)      # 12–16 weeks
+H1_DAYS = (160, 200)          # 24–28 weeks year-to-date
+NINE_M_DAYS = (245, 295)      # 36–40 weeks year-to-date
 YEAR_DAYS = (350, 380)        # 52/53-week or calendar year
 DAYS_PER_QUARTER = 91.3
 MAX_TTM_AGE_DAYS = 270        # newest TTM older than this → company stopped filing
