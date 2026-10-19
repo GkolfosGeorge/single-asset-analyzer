@@ -104,8 +104,10 @@ def get_classification(tickers: list[str], cache_path: str = "data/classificatio
     timestamp and are retried after `retry_failed_after_days` — so one bad
     run can't poison the cache with "Unknown" for a month.
     """
+    import logging
     import yfinance as yf
 
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)   # 404s of delisted tickers are expected
     path = Path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     cache = {}
@@ -314,10 +316,10 @@ def print_pe_summary(h: PEHistory) -> None:
         print(f"  P/E: —  ({why})")
         return
     pe_hist = s["pe"].dropna()
-    pct = (pe_hist < last["pe"]).mean() * 100
+    pct = (pe_hist > last["pe"]).mean() * 100      # days when it was MORE expensive
     print(f"  Τιμή {last['close']:.2f} / EPS TTM {last['eps_ttm']:.2f} = P/E {last['pe']:.1f}")
     print(f"  Διάμεσος P/E της ίδιας ({pe_hist.index[0].year}–): {pe_hist.median():.1f}"
-          f"  → το σημερινό είναι υψηλότερο από το {pct:.0f}% των ημερών")
+          f"  → σήμερα είναι φθηνότερη απ' ό,τι στο {pct:.0f}% των ημερών")
     med = h.peers["median"].reindex(s.index).iloc[-1] if not h.peers.empty else np.nan
     if pd.notna(med):
         n = int(h.peers["n_peers"].reindex(s.index).iloc[-1])
