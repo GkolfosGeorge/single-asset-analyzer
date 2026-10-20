@@ -8,9 +8,19 @@ P/S = market cap / revenue TTM
   margin) and cheap for a software company (30% margin). Only compare a
   stock with ITS OWN history or with very similar companies.
 
-SHAREHOLDER YIELD = (dividends paid + buybacks) TTM / market cap
+SHAREHOLDER YIELD = dividend yield + buyback yield
   What the company handed back to shareholders in cash in the last year.
   Example: dividends 2 bn + buybacks 3 bn, market cap 100 bn → 5%.
+
+  DIVIDENDS come from Yahoo, not the SEC: dividend per share with EX-DATE
+  in the last 365 days / price. A SEC cash-flow TTM counts payments by
+  fiscal quarter, and a 52/53-week quarter can end just before or just
+  after a payment date. KO pays around April 1: Q1-2025 ended March 28
+  (payment fell in Q2), Q1-2026 ended April 3 (payment fell in Q1), so the
+  TTM to April 2026 held FIVE payments (11.0 bn vs 8.8 bn for the year).
+  By ex-date there are always four for a quarterly payer.
+  BUYBACKS stay on the SEC TTM: they happen throughout the quarter, not
+  on one day, so quarter boundaries don't distort them.
 
   Buybacks are GROSS cash spent. Many companies (especially tech) pay
   employees in stock and buy shares back just to cancel that dilution, so
@@ -19,9 +29,9 @@ SHAREHOLDER YIELD = (dividends paid + buybacks) TTM / market cap
   buyback only offset stock compensation.
     net reduction in shares = shares 1 year ago / shares today − 1
 
-Missing tags: a company that has NEVER tagged dividends (or buybacks) is
-taken as paying 0. A company that tagged them before but not recently is
-left unknown (NaN), because it may have switched to another tag.
+Missing buyback tag: a company that has NEVER tagged buybacks is taken as
+buying back 0. One that tagged them before but not recently is left
+unknown (NaN), because it may have switched to another tag.
 """
 
 from dataclasses import dataclass
@@ -33,7 +43,6 @@ from .ttm import MAX_TTM_AGE_DAYS, asof_daily, build_ttm, load_metric
 from . import yields as Y
 
 REVENUE = "Revenues"
-DIVIDENDS = "PaymentsOfDividends"
 BUYBACKS = "PaymentsForRepurchaseOfCommonStock"
 
 
@@ -72,11 +81,10 @@ def payout_history(ticker: str, engine, years: int = 10, as_of=None,
     if rev.empty:
         notes.append(f"P/S: χωρίς έσοδα στη βάση ({REVENUE}): άλλο tag")
 
-    d["div_ttm"] = _ttm_or_zero(DIVIDENDS, ticker, engine, as_of, idx, "div_ttm", notes,
-                                "Μερίσματα").to_numpy()
+    d["div_yield"] = d["div_ps_365d"] / d["close"]           # Yahoo, by ex-date
+    d["div_ttm"] = d["div_ps_365d"] * d["shares"]            # for display, in $
     d["buyback_ttm"] = _ttm_or_zero(BUYBACKS, ticker, engine, as_of, idx, "buyback_ttm", notes,
                                     "Buybacks").to_numpy()
-    d["div_yield"] = d["div_ttm"] / d["mcap"]
     d["buyback_yield"] = d["buyback_ttm"] / d["mcap"]
     d["sh_yield"] = d["div_yield"] + d["buyback_yield"]
     # share_change_12m comes from yields.fcf_history (period vs period, no spikes)
@@ -106,7 +114,8 @@ def print_payout_summary(h: PayoutHistory) -> None:
 
     if pd.notna(last["sh_yield"]):
         print(f"  Shareholder yield: {last['sh_yield'] * 100:.2f}%"
-              f" = μερίσματα {last['div_yield'] * 100:.2f}% ({last['div_ttm'] / 1e9:,.2f} bn)"
+              f" = μερίσματα {last['div_yield'] * 100:.2f}% ({last['div_ps_365d']:.2f}$/μετοχή,"
+              f" ≈ {last['div_ttm'] / 1e9:,.2f} bn)"
               f" + buybacks {last['buyback_yield'] * 100:.2f}% ({last['buyback_ttm'] / 1e9:,.2f} bn)")
     else:
         print("  Shareholder yield: —  (βλ. σημειώσεις)")

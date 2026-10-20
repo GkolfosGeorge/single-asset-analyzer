@@ -87,7 +87,7 @@ def _download(yf, tickers, start, end, threads):
     raw = yf.download(list(tickers), start=str(start), end=None if end is None else str(end),
                       auto_adjust=False, actions=True, progress=False, threads=threads)
     if raw is None or raw.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     def _field(name):
         if isinstance(raw.columns, pd.MultiIndex):
@@ -97,16 +97,21 @@ def _download(yf, tickers, start, end, threads):
         return raw[[name]].rename(columns={name: list(tickers)[0]})  # single ticker → flat columns
 
     close, splits = _field("Close"), _field("Stock Splits").fillna(0.0)
-    for df in (close, splits):
+    divs = _field("Dividends").fillna(0.0)
+    for df in (close, splits, divs):
         df.index = pd.to_datetime(df.index).tz_localize(None)
-    return close, splits
+    return close, splits, divs
 
 
-def load_prices(tickers: list[str], start, end=None, retries: int = 1) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_prices(tickers: list[str], start, end=None, retries: int = 1,
+                with_dividends: bool = False):
     """
     Returns (close, splits), both DataFrames indexed by date, one column per
     ticker. close = split-adjusted, NOT dividend-adjusted. splits = ratio on
     the split day (4.0 for 4:1, 0.1 for a 1:10 reverse split), 0 otherwise.
+
+    with_dividends=True adds a third DataFrame: dividend per share on its
+    EX-DATE (0 on other days), in the same split-adjusted units as close.
 
     Yahoo sometimes drops a few tickers of a big parallel request (INTC, ADP
     "possibly delisted" while they trade normally). Tickers that came back
@@ -118,14 +123,14 @@ def load_prices(tickers: list[str], start, end=None, retries: int = 1) -> tuple[
 
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)   # 404s of delisted tickers are expected
     tickers = list(dict.fromkeys(tickers))
-    close, splits = _download(yf, tickers, start, end, threads=True)
+    close, splits, divs = _download(yf, tickers, start, end, threads=True)
     for _ in range(retries):
         have = set(close.columns[close.notna().any()]) if not close.empty else set()
         missing = [t for t in tickers if t not in have]
         if not missing or len(missing) == len(tickers) and len(tickers) == 1:
             break
         time.sleep(2.0)
-        c2, s2 = _download(yf, missing, start, end, threads=False)
+        c2, s2, d2 = _download(yf, missing, start, end, threads=False)
         if c2.empty:
             break
         got = [t for t in c2.columns if c2[t].notna().any()]
@@ -133,8 +138,9 @@ def load_prices(tickers: list[str], start, end=None, retries: int = 1) -> tuple[
             break
         close = c2[got] if close.empty else close.drop(columns=got, errors="ignore").join(c2[got], how="outer")
         splits = s2[got] if splits.empty else splits.drop(columns=got, errors="ignore").join(s2[got], how="outer")
-    splits = splits.fillna(0.0)
-    return close, splits
+        divs = d2[got] if divs.empty else divs.drop(columns=got, errors="ignore").join(d2[got], how="outer")
+    splits, divs = splits.fillna(0.0), divs.fillna(0.0)
+    return (close, splits, divs) if with_dividends else (close, splits)
 
 
 # ═════════════════════════════════════════════════════════════════════════

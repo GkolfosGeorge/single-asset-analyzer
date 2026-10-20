@@ -88,7 +88,8 @@ def fcf_history(ticker: str, engine, years: int = 10, as_of=None) -> FCFHistory:
     start = end - pd.DateOffset(years=years)
     dl_start = (start - timedelta(days=SPLIT_LOOKBACK_DAYS)).date()
 
-    close, splits = load_prices([ticker], dl_start, (end + timedelta(days=1)).date())
+    close, splits, divs = load_prices([ticker], dl_start, (end + timedelta(days=1)).date(),
+                                      with_dividends=True)
     if ticker not in close.columns or close[ticker].dropna().empty:
         return FCFHistory(ticker, pd.DataFrame(), "χωρίς τιμές (yfinance)")
     sp = splits[ticker] if ticker in splits.columns else None
@@ -99,6 +100,14 @@ def fcf_history(ticker: str, engine, years: int = 10, as_of=None) -> FCFHistory:
     d = build_daily(close[ticker], shares, fcf)
     # positive = fewer shares than one year earlier (period vs period)
     d["share_change_12m"] = asof_daily(d.index, yoy_change(shares, "shares"), "chg").to_numpy()
+    # dividends per share with ex-date in the last 365 days (computed BEFORE trimming
+    # to the window, so the first year of the window is complete too)
+    dps = divs[ticker] if ticker in divs.columns else pd.Series(0.0, index=close.index)
+    # An ex-date that moves a day or two from year to year (weekends) makes an exact
+    # 365-day window hold 3 or 5 payments for 1-3 days. The median of the last
+    # 21 trading days removes those blips; a real dividend change shows up ~2 weeks later.
+    raw365 = dps.reindex(d.index, fill_value=0.0).rolling("365D").sum()
+    d["div_ps_365d"] = raw365.rolling(21, min_periods=1).median().to_numpy()
     d = d[(d.index >= start) & (d.index <= end)]
 
     if rows[CAPEX].empty:
