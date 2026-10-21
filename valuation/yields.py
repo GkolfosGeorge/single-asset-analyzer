@@ -28,10 +28,22 @@ import numpy as np
 import pandas as pd
 
 from .ttm import (MAX_TTM_AGE_DAYS, _build_quarters, _fmt, asof_daily, build_latest,
-                  build_ttm, load_metric, load_prices, newest_only, yoy_change)
+                  build_ttm, load_metric, load_metrics, load_prices, newest_only, yoy_change)
 
 CFO = "NetCashProvidedByUsedInOperatingActivities"
 CAPEX = "PaymentsToAcquirePropertyPlantAndEquipment"
+# Capex tags in priority order (all ingested since trading-shared-data v0.1.25).
+# Only tags that mean "ALL capex" are used: e.g. HD reports capex only as
+# ProductiveAssets (PP&E + software). Partial tags — ConstructionInProcess,
+# MachineryAndEquipment, OtherPropertyPlantAndEquipment — are in the DB but
+# NOT used here: alone they would understate capex and flatter FCF.
+CAPEX_TAGS = [
+    CAPEX,
+    "PaymentsToAcquireProductiveAssets",
+    "PaymentsToAcquireOilAndGasPropertyAndEquipment",
+    "PaymentsToAcquireOilAndGasProperty",
+    "PaymentsForCapitalImprovements",
+]
 SHARES = "WeightedAverageNumberOfDilutedSharesOutstanding"
 SPLIT_LOOKBACK_DAYS = 500
 
@@ -40,16 +52,45 @@ SPLIT_LOOKBACK_DAYS = 500
 # 1. PURE LOGIC
 # ═════════════════════════════════════════════════════════════════════════
 
-def fcf_ttm(cfo_rows: pd.DataFrame, capex_rows: pd.DataFrame) -> pd.DataFrame:
+def capex_ttm(capex_rows: pd.DataFrame | dict) -> pd.DataFrame:
     """
-    TTM FCF per period, columns: period_end, available, cfo_ttm, capex_ttm, fcf_ttm.
+    Capex TTM per period from several candidate tags, WITHOUT mixing them:
+    a TTM is built from ONE tag at a time (its 4 quarters all share the same
+    definition); for each period the highest-priority tag that has a TTM wins.
+    `capex_rows`: rows with a `metric` column, or {tag: rows}.
+    Columns: period_end, available, capex_ttm, capex_tag.
+    """
+    cols = ["period_end", "available", "capex_ttm", "capex_tag"]
+    if isinstance(capex_rows, pd.DataFrame):
+        if "metric" not in capex_rows.columns:          # single-tag rows (old call style)
+            capex_rows = {CAPEX: capex_rows}
+        else:
+            capex_rows = {m: g for m, g in capex_rows.groupby("metric")}
+    parts = []
+    for prio, tag in enumerate(CAPEX_TAGS):
+        rows = capex_rows.get(tag)
+        if rows is None or rows.empty:
+            continue
+        t = build_ttm(rows, value_col="capex_ttm")
+        if not t.empty:
+            parts.append(t.assign(capex_tag=tag, _prio=prio))
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    allp = pd.concat(parts, ignore_index=True).sort_values(["period_end", "_prio"])
+    best = allp.drop_duplicates("period_end", keep="first")[cols]
+    return newest_only(best)
+
+
+def fcf_ttm(cfo_rows: pd.DataFrame, capex_rows: pd.DataFrame | dict) -> pd.DataFrame:
+    """
+    TTM FCF per period, columns: period_end, available, cfo_ttm, capex_ttm, fcf_ttm, capex_tag.
     A period counts only when BOTH CFO and capex TTM exist for the same
     period_end; it becomes usable when the later of the two is filed
     (normally the same filing).
     """
-    cols = ["period_end", "available", "cfo_ttm", "capex_ttm", "fcf_ttm"]
+    cols = ["period_end", "available", "cfo_ttm", "capex_ttm", "fcf_ttm", "capex_tag"]
     cfo = build_ttm(cfo_rows, value_col="cfo_ttm")
-    capex = build_ttm(capex_rows, value_col="capex_ttm")
+    capex = capex_ttm(capex_rows)
     if cfo.empty or capex.empty:
         return pd.DataFrame(columns=cols)
     m = cfo.merge(capex, on="period_end", suffixes=("_cfo", "_capex"))
@@ -75,6 +116,11 @@ def build_daily(close: pd.Series, shares: pd.DataFrame, fcf: pd.DataFrame) -> pd
     d["mcap"] = d["close"] * d["shares"]
     for c in ("cfo_ttm", "capex_ttm", "fcf_ttm"):
         d[c] = asof_daily(d.index, fcf, c).to_numpy() if not fcf.empty else np.nan
+    d["capex_tag"] = None
+    if not fcf.empty and "capex_tag" in fcf:
+        f = fcf.sort_values("available")
+        pos = f["available"].searchsorted(d.index, side="right") - 1
+        d["capex_tag"] = [f["capex_tag"].iloc[i] if i >= 0 else None for i in pos]
     d["fcf_yield"] = d["fcf_ttm"] / d["mcap"]
     return d
 
@@ -93,10 +139,12 @@ def fcf_history(ticker: str, engine, years: int = 10, as_of=None) -> FCFHistory:
     if ticker not in close.columns or close[ticker].dropna().empty:
         return FCFHistory(ticker, pd.DataFrame(), "χωρίς τιμές (yfinance)")
     sp = splits[ticker] if ticker in splits.columns else None
-    rows = {m: load_metric(m, [ticker], engine, as_of=as_of) for m in (CFO, CAPEX, SHARES)}
+    allrows = load_metrics([CFO, SHARES] + CAPEX_TAGS, [ticker], engine, as_of=as_of)  # ONE query
+    rows = {m: allrows[allrows["metric"] == m] for m in [CFO, SHARES] + CAPEX_TAGS}
+    capex_rows = {m: rows[m] for m in CAPEX_TAGS}
 
     shares = build_latest(rows[SHARES], sp, shares=True, value_col="shares")
-    fcf = fcf_ttm(rows[CFO], rows[CAPEX])
+    fcf = fcf_ttm(rows[CFO], capex_rows)
     d = build_daily(close[ticker], shares, fcf)
     # positive = fewer shares than one year earlier (period vs period)
     d["share_change_12m"] = asof_daily(d.index, yoy_change(shares, "shares"), "chg").to_numpy()
@@ -110,8 +158,8 @@ def fcf_history(ticker: str, engine, years: int = 10, as_of=None) -> FCFHistory:
     d["div_ps_365d"] = raw365.rolling(21, min_periods=1).median().to_numpy()
     d = d[(d.index >= start) & (d.index <= end)]
 
-    if rows[CAPEX].empty:
-        status = f"χωρίς capex στη βάση ({CAPEX}): η εταιρεία χρησιμοποιεί άλλο tag"
+    if all(r.empty for r in capex_rows.values()):
+        status = "χωρίς capex στη βάση (κανένα από τα tags capex): π.χ. τράπεζα/ασφαλιστική"
     elif rows[CFO].empty:
         status = "χωρίς CFO στη βάση"
     elif shares.empty:
@@ -138,6 +186,9 @@ def print_fcf_summary(h: FCFHistory) -> None:
         return
     print(f"  FCF TTM: CFO {last['cfo_ttm'] / 1e9:,.2f} bn − capex {last['capex_ttm'] / 1e9:,.2f} bn"
           f" = {last['fcf_ttm'] / 1e9:,.2f} bn$")
+    tag = d["capex_tag"].dropna().iloc[-1] if "capex_tag" in d and d["capex_tag"].notna().any() else CAPEX
+    if tag != CAPEX:
+        print(f"     capex από: {tag}")
     y = last["fcf_yield"]
     pfcf = f"P/FCF {1 / y:.1f}" if y > 0 else "αρνητικό FCF: η εταιρεία καίει μετρητά"
     print(f"  FCF yield: {y * 100:.2f}%   ({pfcf})")
@@ -161,8 +212,14 @@ def debug_fcf(ticker: str, engine, n: int = 5) -> None:
     _, splits = load_prices([ticker], (date.today() - timedelta(days=3 * 365)))
     sp = splits[ticker] if ticker in splits.columns else None
 
-    for name, metric in (("CFO", CFO), ("Capex", CAPEX)):
-        rows = load_metric(metric, [ticker], engine)
+    allrows = load_metrics([CFO] + CAPEX_TAGS, [ticker], engine)
+    have = [t for t in CAPEX_TAGS if (allrows["metric"] == t).any()]
+    used = capex_ttm({t: allrows[allrows["metric"] == t] for t in have})
+    capex_tag = used["capex_tag"].iloc[-1] if not used.empty else (have[0] if have else CAPEX)
+    print(f"── {ticker} tags capex στη βάση: {', '.join(have) or 'κανένα'}"
+          f"  → χρησιμοποιείται: {capex_tag if have else '—'}")
+    for name, metric in (("CFO", CFO), ("Capex", capex_tag)):
+        rows = allrows[allrows["metric"] == metric]
         print(f"\n── {ticker} {name}: τελευταία τρίμηνα (source = από πού βγήκε) ──")
         if rows.empty:
             print(f"  καμία γραμμή {metric}")

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "single-asset-analyzer"
+version = "0.1.0"
+description = "Point-in-time valuation (P/E, FCF yield, EV/EBIT, P/S, shareholder yield) and quality scores (Piotroski) for one stock, on SEC fundamentals from trading-shared-data."
+requires-python = ">=3.11"
+dependencies = [
+    # pandas, numpy, yfinance, sqlalchemy, psycopg2 come with trading-shared-data
+    "trading-shared-data @ git+https://github.com/GkolfosGeorge/shared-data-layer.git@v0.1.25",
+    "matplotlib>=3.7",
+]
+
+[tool.setuptools]
+packages = ["valuation", "quality_scores"]
+py-modules = ["data_quality"]       # used by quality_scores/diagnostics.py

@@ -1,4 +1,4 @@
-trading-shared-data @ git+https://github.com/GkolfosGeorge/shared-data-layer.git@v0.1.24
+trading-shared-data @ git+https://github.com/GkolfosGeorge/shared-data-layer.git@v0.1.25
 scipy>=1.11
 matplotlib>=3.7
 sqlalchemy>=2.0

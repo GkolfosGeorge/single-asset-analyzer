@@ -37,7 +37,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .ttm import _fmt, asof_daily, build_ttm, load_metric, newest_only
+from .ttm import _fmt, asof_daily, build_ttm, load_metric, load_metrics, newest_only
 from . import yields as Y
 
 EBIT = "OperatingIncomeLoss"
@@ -145,13 +145,7 @@ class EVHistory:
 
 
 def _load_many(metrics, ticker, engine, as_of):
-    parts = []
-    for m in metrics:
-        r = load_metric(m, [ticker], engine, as_of=as_of)
-        if not r.empty:
-            parts.append(r.assign(metric=m))
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
-        columns=["ticker", "value", "period_start", "period_end", "filed_date", "form_type", "metric"])
+    return load_metrics(metrics, [ticker], engine, as_of=as_of)     # one query, not one per tag
 
 
 def ev_history(ticker: str, engine, years: int = 10, as_of=None,

@@ -83,6 +83,33 @@ def load_metric(metric: str, tickers: list[str], engine, as_of=None) -> pd.DataF
     return df
 
 
+def load_metrics(metrics: list[str], tickers: list[str], engine, as_of=None) -> pd.DataFrame:
+    """Like load_metric, but MANY metrics in ONE query (adds a `metric` column).
+    Each round-trip to Neon costs ~0.5-1 s from Greece, so one query instead of
+    ~15 matters when a run analyses a dozen tickers."""
+    where = ["m.name = ANY(:metrics)", "f.ticker = ANY(:tickers)", "ft.name IN ('10-Q', '10-K')"]
+    params = {"metrics": list(metrics), "tickers": list(tickers)}
+    if as_of:
+        where.append("f.filed_date <= CAST(:as_of AS DATE)")
+        params["as_of"] = str(as_of)
+    sql = text(f"""
+        SELECT f.ticker, f.value, f.period_start, f.period_end, f.filed_date,
+               ft.name AS form_type, m.name AS metric
+        FROM fundamentals f
+        JOIN metric_lookup m     ON m.id  = f.metric_id
+        JOIN form_type_lookup ft ON ft.id = f.form_type_id
+        WHERE {' AND '.join(where)}
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    df = pd.DataFrame(rows, columns=["ticker", "value", "period_start", "period_end",
+                                     "filed_date", "form_type", "metric"])
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    for c in ("period_start", "period_end", "filed_date"):
+        df[c] = pd.to_datetime(df[c])
+    return df
+
+
 def _download(yf, tickers, start, end, threads):
     raw = yf.download(list(tickers), start=str(start), end=None if end is None else str(end),
                       auto_adjust=False, actions=True, progress=False, threads=threads)
