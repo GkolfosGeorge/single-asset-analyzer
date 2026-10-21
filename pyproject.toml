@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "single-asset-analyzer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Point-in-time valuation (P/E, FCF yield, EV/EBIT, P/S, shareholder yield) and quality scores (Piotroski) for one stock, on SEC fundamentals from trading-shared-data."
 requires-python = ">=3.11"
 dependencies = [

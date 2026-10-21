@@ -59,6 +59,7 @@ F_FAIL = {   # what a ✗ means, in the card
 class Metric:
     value: float
     pct: float          # % of past days that were MORE expensive than today
+    since: int | None = None   # first year with a value (GEV: 2024, not 10 years)
 
     @property
     def label(self) -> str:
@@ -101,7 +102,7 @@ def _own_metric(s: pd.Series, lower_is_cheaper: bool) -> Metric | None:
         return None
     today = float(s.iloc[-1])
     pct = ((hist > today) if lower_is_cheaper else (hist < today)).mean() * 100
-    return Metric(today, float(pct))
+    return Metric(today, float(pct), int(hist.index[0].year))
 
 
 def _value_year_ago(s: pd.Series, end: pd.Timestamp) -> float | None:
@@ -204,8 +205,9 @@ _WORD = {"cheap": "φθηνή", "expensive": "ακριβή", "normal": "κανο
 
 
 def verdict(snap: QuickSnapshot) -> tuple[str, str]:
-    """(emoji, phrase) from P/E, EV/EBIT, FCF yield — whichever exist."""
-    ms = [m for m in (snap.pe, snap.ev_ebit, snap.fcf_yield) if m is not None]
+    """(emoji, phrase) from P/E, EV/EBIT, FCF yield — whichever exist (P/E only for financials)."""
+    cands = (snap.pe,) if snap.financial else (snap.pe, snap.ev_ebit, snap.fcf_yield)
+    ms = [m for m in cands if m is not None]
     if not ms:
         return "⚪", "Αποτίμηση μη διαθέσιμη"
     # Disagreement is the most informative case (e.g. MSFT 2026: P/E and
@@ -213,7 +215,8 @@ def verdict(snap: QuickSnapshot) -> tuple[str, str]:
     # "normal" only when ALL agree, and a clear call only when the majority
     # agrees and nobody points the other way. Everything else is "mixed".
     labels = [m.label for m in ms]
-    n_c, n_e, half = labels.count("cheap"), labels.count("expensive"), math.ceil(len(ms) / 2)
+    # strict majority: with 2 metrics "1 cheap + 1 normal" is mixed, same as with 3
+    n_c, n_e, half = labels.count("cheap"), labels.count("expensive"), len(ms) // 2 + 1
     if n_c >= half and n_e == 0:
         return "🟢", "Φθηνή για τα δικά της δεδομένα"
     if n_e >= half and n_c == 0:
@@ -227,10 +230,12 @@ def _metric_txt(name: str, m: Metric | None, fmt: str) -> str | None:
     if m is None:
         return None
     txt = f"{name} {format(m.value, fmt)}"
+    # "10ετίας" only when there really are ~10 years (a 2024 spin-off has 2)
+    span = "10ετίας" if (m.since is None or date.today().year - m.since >= 9) else f"από το {m.since}"
     if m.pct <= 1:
-        return txt + " (ακριβότερη 10ετίας)"
+        return txt + f" (ακριβότερη {span})"
     if m.pct >= 99:
-        return txt + " (φθηνότερη 10ετίας)"
+        return txt + f" (φθηνότερη {span})"
     return txt if m.label == "normal" else f"{txt} ({_WORD[m.label]})"
 
 
@@ -252,15 +257,17 @@ def format_card(snap: QuickSnapshot, indent: str = "  ") -> list[str]:
     lines = []
     emoji, phrase = verdict(snap)
     parts = [_metric_txt("P/E", snap.pe, ".0f"),
-             _metric_txt("EV/EBIT", snap.ev_ebit, ".0f"),
-             _metric_txt("FCF", snap.fcf_yield, ".1%")]
+             _metric_txt("EV/EBIT", None if snap.financial else snap.ev_ebit, ".0f"),
+             _metric_txt("FCF", None if snap.financial else snap.fcf_yield, ".1%")]
     lines.append(f"{indent}💰 {emoji} {phrase}   " + " · ".join(p for p in parts if p))
 
     q = []
     if snap.eps_negative:
         q.append("Ζημιές (EPS ≤ 0)")
     elif snap.eps_growth_1y is not None:
-        q.append(f"Κέρδη {snap.eps_growth_1y:+.0%} σε 1 χρόνο")
+        g = snap.eps_growth_1y
+        q.append(f"Κέρδη ×{1 + g:.1f} σε 1 χρόνο (από χαμηλή βάση)" if g > 1
+                 else f"Κέρδη {g:+.0%} σε 1 χρόνο")
     if snap.div_yield:
         q.append(f"μέρισμα {snap.div_yield:.1%}")
     if q:
@@ -277,7 +284,8 @@ def format_card(snap: QuickSnapshot, indent: str = "  ") -> list[str]:
             and snap.fcf_yield.label == "expensive"):
         lines.append(f"{indent}ℹ️ Τα μετρητά πάνε σε επενδύσεις (capex ×{snap.capex_x_1y:.1f} σε 1 χρόνο)")
     if snap.financial:
-        lines.append(f"{indent}ℹ️ Χρηματοοικονομική εταιρεία: EV/EBIT και FCF δεν έχουν νόημα")
+        lines.append(f"{indent}ℹ️ Χρηματοοικονομική εταιρεία: EV/EBIT, FCF και μέρος της Υγείας "
+                     f"(ταμειακές ροές) δεν έχουν νόημα· κοίτα κυρίως το P/E")
     return lines
 
 
