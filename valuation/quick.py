@@ -80,6 +80,7 @@ class QuickSnapshot:
     eps_negative: bool = False
     fscore: tuple[int, int] | None = None    # (score, max_score)
     fscore_detail: dict[str, bool | None] = field(default_factory=dict)   # criterion → ✓/✗/None
+    fscore_flags: list[tuple[str, str]] = field(default_factory=list)     # (criterion, 🚩 text)
     div_yield: float | None = None
     capex_x_1y: float | None = None          # capex TTM now / a year ago
     days_since_report: int | None = None
@@ -185,11 +186,12 @@ def quick_snapshot(ticker: str, engine, years: int = 10, as_of=None,
 
     # ── Piotroski ──
     def _fscore():
-        from quality_scores.piotroski import piotroski_f_score
+        from quality_scores.piotroski import piotroski_f_score, red_flags
         r = piotroski_f_score(ticker, engine, as_of=as_of)
         if r is not None and r.max_score > 0:
             snap.fscore = (int(r.score), int(r.max_score))
             snap.fscore_detail = dict(r.breakdown)
+            snap.fscore_flags = [(f.criterion, f.text("el")) for f in red_flags(r)]
     part("F-Score", _fscore)
 
     if with_earnings_date and as_of is None:
@@ -291,9 +293,12 @@ def format_card(snap: QuickSnapshot, indent: str = "  ") -> list[str]:
 
 def _health_lines(snap: QuickSnapshot, indent: str) -> list[str]:
     """
-    🩺 Υγεία 6/9   Κερδοφορία ✓✓✓✓ · Χρέος/ρευστότητα ✓✗✓ · Αποδοτικότητα ✗✗
-       ✗ ρευστότητα ↓ · μεικτό περιθώριο ↓ · αποδοτικότητα assets ↓
+    🩺 Υγεία 5/9   Κερδοφορία ✓✓✓✗ · Χρέος/ρευστότητα ✓✗✗ · Αποδοτικότητα ✓✗
+       🚩 ταμείο 35% κάτω από τα κέρδη · νέες μετοχές +4.1%
+       ✗ ρευστότητα ↓ · αποδοτικότητα assets ↓
     – = not evaluated (missing data), so 6/8 means 8 criteria could be judged.
+    🚩 = the serious failures (see piotroski.red_flags); they are NOT repeated
+    in the ✗ line. "Ζημιές" is skipped here when the 📈 line already says so.
     """
     if not snap.fscore:
         return []
@@ -301,7 +306,13 @@ def _health_lines(snap: QuickSnapshot, indent: str) -> list[str]:
     det = snap.fscore_detail
     groups = " · ".join(f"{name} " + "".join(sym[det.get(k)] for k in keys) for name, keys in F_GROUPS)
     out = [f"{indent}🩺 Υγεία {snap.fscore[0]}/{snap.fscore[1]}   {groups}"]
-    fails = [F_FAIL[k] for _, keys in F_GROUPS for k in keys if det.get(k) is False]
+    flags = [(k, t) for k, t in snap.fscore_flags
+             if not (k == "positive_roa" and snap.eps_negative)]
+    if flags:
+        out.append(f"{indent}   🚩 " + " · ".join(t for _, t in flags))
+    flagged = {k for k, _ in snap.fscore_flags}
+    fails = [F_FAIL[k] for _, keys in F_GROUPS for k in keys
+             if det.get(k) is False and k not in flagged]
     if fails:
         out.append(f"{indent}   ✗ " + " · ".join(fails))
     return out
@@ -329,5 +340,7 @@ def legend() -> list[str]:
     ]
     for name, keys in F_GROUPS:
         out.append(f"   {name}: " + " · ".join(f"{i}) {F_PASS[k]}" for i, k in enumerate(keys, 1)))
+    out.append("   🚩 = σοβαρό ✗ ανεξάρτητα από το σκορ: ζημιές, αρνητικές ταμειακές ροές,")
+    out.append("   ταμείο < 80% των κερδών, νέες μετοχές ≥ 2%.")
     out.append("Πληροφορία, όχι σήμα.")
     return out

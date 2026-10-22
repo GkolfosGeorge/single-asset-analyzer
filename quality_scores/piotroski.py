@@ -88,6 +88,10 @@ NOTES = {
         "split": "πιθανό split {ratio} — η σύγκριση δεν έχει νόημα",
         "debt_total": "χρέος: μακροπρόθεσμο + τρέχον μέρος",
         "debt_noncurrent": "χρέος: μόνο μακροπρόθεσμο (ίδιο μέτρο και στα δύο έτη)",
+        "debt_ltd": "χρέος: LongTermDebt (μαζί με το τρέχον μέρος)",
+        "debt_lease_total": "χρέος: μαζί με finance leases και τρέχον μέρος",
+        "debt_lease_sum": "χρέος: μακροπρόθεσμο + τρέχον, μαζί με finance leases",
+        "debt_lease_noncurrent": "χρέος: μόνο μακροπρόθεσμο, μαζί με finance leases",
         "shares_period_end": "μετοχές στο τέλος της χρονιάς",
         "shares_weighted": "μέσος όρος μετοχών στη χρονιά",
         "gp_reported": "δηλωμένο μεικτό κέρδος",
@@ -102,6 +106,10 @@ NOTES = {
         "split": "likely stock split {ratio} — comparison not meaningful",
         "debt_total": "debt: noncurrent + current portion",
         "debt_noncurrent": "debt: noncurrent only (same measure both years)",
+        "debt_ltd": "debt: LongTermDebt (current part included)",
+        "debt_lease_total": "debt: incl. finance leases and current part",
+        "debt_lease_sum": "debt: noncurrent + current, incl. finance leases",
+        "debt_lease_noncurrent": "debt: noncurrent only, incl. finance leases",
         "shares_period_end": "period-end shares",
         "shares_weighted": "weighted-average shares",
         "gp_reported": "reported gross profit",
@@ -174,15 +182,24 @@ def _consistent_pair(curr: AnnualSnapshot, prev: AnnualSnapshot, options):
     return None, None, ""
 
 
-def _debt_total(s: AnnualSnapshot):
-    if s.lt_debt_noncurrent is None or s.lt_debt_current is None:
-        return None
-    return s.lt_debt_noncurrent + s.lt_debt_current
+def _sum(a: float | None, b: float | None) -> float | None:
+    return None if (a is None or b is None) else a + b
 
 
+# Order matters: the first option available in BOTH years wins.
+# The first two are the pre-v0.1.2 options, kept first ON PURPOSE: a company
+# that was already scored keeps exactly the same measure (no regression).
+# The rest only fill gaps — companies that report debt only under the
+# tags added in Sept 2026 (HD, KLAC, GEV...).
+# Each option is ONE definition used in both years; we never add a total
+# tag (LongTermDebt) to a current-part tag, which would count it twice.
 _DEBT_OPTIONS = [
-    ("debt_total", _debt_total),
+    ("debt_total", lambda s: _sum(s.lt_debt_noncurrent, s.lt_debt_current)),
     ("debt_noncurrent", lambda s: s.lt_debt_noncurrent),
+    ("debt_ltd", lambda s: s.lt_debt_total),
+    ("debt_lease_total", lambda s: s.lt_debt_lease_total),
+    ("debt_lease_sum", lambda s: _sum(s.lt_debt_lease_noncurrent, s.lt_debt_lease_current)),
+    ("debt_lease_noncurrent", lambda s: s.lt_debt_lease_noncurrent),
 ]
 _SHARES_OPTIONS = [
     ("shares_period_end", lambda s: s.shares_period_end),
@@ -341,6 +358,83 @@ def score_from_snapshots(ticker: str, snapshots: list[AnnualSnapshot]) -> Piotro
     )
 
 
+# ── red flags ("βέτο") ────────────────────────────────────────────────────
+# The 9 criteria are NOT equally serious, but the F-Score adds them up as
+# if they were: 6/9 from failing the three cash/profit checks and 6/9 from
+# failing liquidity, turnover and a 0.3% share increase look the same.
+# Red flags pull the serious failures out so the card shows them
+# regardless of the total. They do NOT change score/max_score.
+#
+# Thresholds are judgement calls, NOT backtested (that needs the
+# investor-screens walk-forward). Small failures stay ordinary ✗:
+#   - no_dilution: +0.5% shares from stock comp is not a red flag; +2% is.
+#   - accruals: CFO a bit below net income is routine; CFO < 80% of it
+#     means a fifth of the reported profit never arrived as cash.
+DILUTION_FLAG = 0.02
+ACCRUALS_FLAG = 0.80
+
+FLAG_TEXT = {
+    "el": {
+        "losses": "ζημιές στο 10-K",
+        "negative_cfo": "αρνητικές ταμειακές ροές",
+        "low_cash_conversion": "ταμείο {gap:.0%} κάτω από τα κέρδη",
+        "dilution": "νέες μετοχές +{pct:.1%}",
+    },
+    "en": {
+        "losses": "net loss in the 10-K",
+        "negative_cfo": "negative operating cash flow",
+        "low_cash_conversion": "cash flow {gap:.0%} below net income",
+        "dilution": "share count +{pct:.1%}",
+    },
+}
+
+
+@dataclass
+class RedFlag:
+    key: str  # "losses" | "negative_cfo" | "low_cash_conversion" | "dilution"
+    criterion: str  # the Piotroski criterion it comes from
+    args: dict = field(default_factory=dict)
+
+    def text(self, lang: str = "el") -> str:
+        return FLAG_TEXT[lang][self.key].format(**self.args)
+
+
+def red_flags(result: PiotroskiResult | None) -> list[RedFlag]:
+    """
+    Example: net income 100, CFO 60 -> cash conversion 60% < 80%
+             -> RedFlag("low_cash_conversion", gap=40%).
+             Shares 1,000M -> 1,031M (+3.1% > 2%) -> RedFlag("dilution").
+    A criterion that is None (missing data) never raises a flag.
+    """
+    if result is None:
+        return []
+    det, flags = result.details, []
+
+    if det["positive_roa"].passed is False:
+        flags.append(RedFlag("losses", "positive_roa"))
+
+    cfo_det = det["positive_cfo"]
+    if cfo_det.passed is False:
+        flags.append(RedFlag("negative_cfo", "positive_cfo"))
+
+    # Accruals: only meaningful when there IS a profit to convert into cash,
+    # and redundant when CFO is already negative (flagged above).
+    ni, cfo = dict(det["cfo_exceeds_net_income"].bars).get("net_income"), cfo_det.bars[0][1]
+    if (det["cfo_exceeds_net_income"].passed is False and cfo_det.passed is True
+            and ni and ni > 0 and cfo / ni < ACCRUALS_FLAG):
+        flags.append(RedFlag("low_cash_conversion", "cfo_exceeds_net_income",
+                             {"gap": 1 - cfo / ni}))
+
+    dil = det["no_dilution"]
+    if dil.passed is False:
+        prev_sh, curr_sh = dict(dil.bars)["prev"], dict(dil.bars)["curr"]
+        growth = curr_sh / prev_sh - 1
+        if growth >= DILUTION_FLAG:
+            flags.append(RedFlag("dilution", "no_dilution", {"pct": growth}))
+
+    return flags
+
+
 # ── history ───────────────────────────────────────────────────────────────
 
 def piotroski_history(ticker: str, engine, n_years: int = 10) -> pd.DataFrame:
@@ -415,3 +509,6 @@ def print_report(result: PiotroskiResult | None, lang: str = "el") -> None:
             print(f"   [{symbol}]  {lab[k]:<28} {nums}")
             if det.note:
                 print(f"            ↳ {note_text(det, lang)}")
+    flags = red_flags(result)
+    if flags:
+        print("\n   🚩 " + " · ".join(f.text(lang) for f in flags))

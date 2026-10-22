@@ -39,6 +39,13 @@ NEEDED_METRICS = [
     "LiabilitiesCurrent",
     "LongTermDebtNoncurrent",
     "LongTermDebtCurrent",
+    # Added v0.1.2 (ingested in trading-shared-data v0.1.23, Sept 2026).
+    # ~half the universe reports debt ONLY under these, so without them
+    # leverage_decreased was N/A for 52% of companies (HD, KLAC, GEV...).
+    "LongTermDebt",  # total: current part INCLUDED
+    "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",  # total incl. finance leases
+    "LongTermDebtAndCapitalLeaseObligations",  # noncurrent incl. finance leases
+    "LongTermDebtAndCapitalLeaseObligationsCurrent",  # current incl. finance leases
     "CommonStockSharesOutstanding",
     "WeightedAverageNumberOfSharesOutstandingBasic",
 ]
@@ -67,6 +74,11 @@ class AnnualSnapshot:
     lt_debt_current: float | None
     shares_period_end: float | None  # CommonStockSharesOutstanding
     shares_weighted_avg: float | None  # WeightedAverageNumberOfSharesOutstandingBasic
+    # v0.1.2 debt tags — defaults keep older code that builds snapshots by hand working
+    lt_debt_total: float | None = None  # LongTermDebt
+    lt_debt_lease_total: float | None = None  # ...IncludingCurrentMaturities
+    lt_debt_lease_noncurrent: float | None = None  # LongTermDebtAndCapitalLeaseObligations
+    lt_debt_lease_current: float | None = None  # LongTermDebtAndCapitalLeaseObligationsCurrent
 
     @property
     def gross_profit_computed(self) -> float | None:
@@ -152,6 +164,11 @@ def get_annual_snapshots(
                 current_liabilities=vals.get("LiabilitiesCurrent"),
                 lt_debt_noncurrent=vals.get("LongTermDebtNoncurrent"),
                 lt_debt_current=vals.get("LongTermDebtCurrent"),
+                lt_debt_total=vals.get("LongTermDebt"),
+                lt_debt_lease_total=vals.get(
+                    "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities"),
+                lt_debt_lease_noncurrent=vals.get("LongTermDebtAndCapitalLeaseObligations"),
+                lt_debt_lease_current=vals.get("LongTermDebtAndCapitalLeaseObligationsCurrent"),
                 shares_period_end=vals.get("CommonStockSharesOutstanding"),
                 shares_weighted_avg=vals.get("WeightedAverageNumberOfSharesOutstandingBasic"),
             )
