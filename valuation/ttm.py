@@ -48,6 +48,10 @@ YEAR_DAYS = (350, 380)        # 52/53-week or calendar year
 DAYS_PER_QUARTER = 91.3
 MAX_TTM_AGE_DAYS = 270        # newest TTM older than this → company stopped filing
 SCALE_ERROR_X = 50            # share count ×50 away from its neighbours → unit error, dropped
+MIN_YARDSTICK_EPS = 0.10      # NI / EPS means nothing with EPS near zero...
+MIN_YARDSTICK_NI = 1e6        # ...or net income near zero
+SCALE_MAX_RESIDUAL_X = 3      # after a repair, shares must be within ×3 of NI / EPS
+SHARES_RANGE = (1e6, 3e10)    # a repair must land here: 1 M to 30 bn shares
 
 COLS = ["period_start", "period_end", "filed_date", "value"]
 
@@ -289,7 +293,10 @@ def build_ttm(rows: pd.DataFrame, splits: pd.Series | None = None,
                         value_col: w["value"].sum()})
     # A full-year 10-K IS a TTM by itself (covers companies with no 10-Q data).
     fy_ttm = fy.rename(columns={"filed_date": "available", "value": value_col})[cols]
-    out = pd.concat([fy_ttm, pd.DataFrame(ttm, columns=cols)], ignore_index=True)
+    # An empty frame must not join the concat: its columns are `object`, which would
+    # turn period_end into object too, and fcf_ttm's merge would then crash.
+    parts = [fy_ttm] + ([pd.DataFrame(ttm, columns=cols)] if ttm else [])
+    out = pd.concat(parts, ignore_index=True)
     out = out.drop_duplicates("period_end", keep="first")      # FY wins on ties: exact, no math
     out["available"] = out["available"] + timedelta(days=1)    # filed after the close → usable next day
 
@@ -310,6 +317,60 @@ def newest_only(out: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_values(["available", "period_end"]).reset_index(drop=True)
     newest_before = out["period_end"].cummax().shift()
     return out[newest_before.isna() | (out["period_end"] > newest_before)].reset_index(drop=True)
+
+
+def repair_share_scale(shares: pd.DataFrame, net_income: pd.DataFrame,
+                       eps: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fixes share counts tagged in the wrong unit, in memory (the DB keeps what
+    was filed). MCD since 2023: 711.1 instead of 711,100,000.
+
+    Independent yardstick from the same period: shares ≈ net income / EPS.
+        MCD: 2.1 bn / 2.95 = 711.9 M vs 711.1 → off by ~10^6 → × 1,000,000
+    Only whole powers of 1000 are applied, and only if the result lands within
+    ×3 of the yardstick. So real differences stay untouched: a 50:1 split between
+    filings (×50 is no power of 1000), or IBKR, whose net income includes the
+    non-controlling part (×0.23, not close to a power).
+
+    The yardstick can be wrong too. BE, Sept 2025: shares were right (234.9 M) but
+    NI / EPS gave 235 k, and "÷1000" would have broken a good row. So a repair must
+    also land on a believable share count (SHARES_RANGE).
+
+    Periods without a yardstick (no match, EPS near zero) stay as they are;
+    if wrong, they are dropped by the ×50 guard of build_latest, now that
+    their neighbours are right.
+    Returns a copy; .attrs["repaired"] lists the changed rows.
+    """
+    df = shares.copy()
+    df.attrs["repaired"] = []
+    key = ["period_start", "period_end"]
+
+    def first_filed(r, col):
+        r = r.dropna(subset=key + ["value"]).sort_values("filed_date")
+        return r.drop_duplicates(key)[key + ["value"]].rename(columns={"value": col})
+
+    if df.empty or net_income.empty or eps.empty:
+        return df
+    y = first_filed(net_income, "ni").merge(first_filed(eps, "eps"), on=key)
+    y = y[(y["eps"].abs() >= MIN_YARDSTICK_EPS) & (y["ni"].abs() >= MIN_YARDSTICK_NI)]
+    if y.empty:
+        return df
+    y["implied"] = (y["ni"] / y["eps"]).abs()
+    m = df[key].merge(y[key + ["implied"]], on=key, how="left")
+    implied, values = m["implied"].to_numpy(), df["value"].to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        power = np.round(np.log(implied / values) / np.log(1000))
+        factor = np.power(1000.0, power)
+        repaired = values * factor
+        close = np.abs(np.log(repaired / implied)) <= np.log(SCALE_MAX_RESIDUAL_X)
+    believable = (repaired >= SHARES_RANGE[0]) & (repaired <= SHARES_RANGE[1])
+    fix = np.isfinite(power) & (power != 0) & (values > 0) & close & believable
+    if fix.any():
+        df.attrs["repaired"] = [
+            {"period_end": p, "filed_date": f, "value": v, "factor": x}
+            for p, f, v, x in zip(df["period_end"][fix], df["filed_date"][fix], values[fix], factor[fix])]
+        df.loc[fix, "value"] = values[fix] * factor[fix]
+    return df
 
 
 def build_latest(rows: pd.DataFrame, splits: pd.Series | None = None,

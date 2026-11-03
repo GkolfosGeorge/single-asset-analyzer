@@ -28,7 +28,8 @@ import numpy as np
 import pandas as pd
 
 from .ttm import (MAX_TTM_AGE_DAYS, _build_quarters, _fmt, asof_daily, build_latest,
-                  build_ttm, load_metric, load_metrics, load_prices, newest_only, yoy_change)
+                  build_ttm, load_metric, load_metrics, load_prices, newest_only,
+                  repair_share_scale, yoy_change)
 
 CFO = "NetCashProvidedByUsedInOperatingActivities"
 CAPEX = "PaymentsToAcquirePropertyPlantAndEquipment"
@@ -45,6 +46,7 @@ CAPEX_TAGS = [
     "PaymentsForCapitalImprovements",
 ]
 SHARES = "WeightedAverageNumberOfDilutedSharesOutstanding"
+NET_INCOME, EPS = "NetIncomeLoss", "EarningsPerShareDiluted"   # yardstick for the share scale
 SPLIT_LOOKBACK_DAYS = 500
 
 
@@ -139,11 +141,13 @@ def fcf_history(ticker: str, engine, years: int = 10, as_of=None) -> FCFHistory:
     if ticker not in close.columns or close[ticker].dropna().empty:
         return FCFHistory(ticker, pd.DataFrame(), "χωρίς τιμές (yfinance)")
     sp = splits[ticker] if ticker in splits.columns else None
-    allrows = load_metrics([CFO, SHARES] + CAPEX_TAGS, [ticker], engine, as_of=as_of)  # ONE query
-    rows = {m: allrows[allrows["metric"] == m] for m in [CFO, SHARES] + CAPEX_TAGS}
+    tags = [CFO, SHARES, NET_INCOME, EPS] + CAPEX_TAGS
+    allrows = load_metrics(tags, [ticker], engine, as_of=as_of)  # ONE query
+    rows = {m: allrows[allrows["metric"] == m] for m in tags}
     capex_rows = {m: rows[m] for m in CAPEX_TAGS}
 
-    shares = build_latest(rows[SHARES], sp, shares=True, value_col="shares")
+    shares_rows = repair_share_scale(rows[SHARES], rows[NET_INCOME], rows[EPS])
+    shares = build_latest(shares_rows, sp, shares=True, value_col="shares")
     fcf = fcf_ttm(rows[CFO], capex_rows)
     d = build_daily(close[ticker], shares, fcf)
     # positive = fewer shares than one year earlier (period vs period)
@@ -232,8 +236,13 @@ def debug_fcf(ticker: str, engine, n: int = 5) -> None:
         for l in bad:
             print("  " + l)
 
-    shares = build_latest(load_metric(SHARES, [ticker], engine), sp, shares=True, value_col="shares")
+    sh = load_metrics([SHARES, NET_INCOME, EPS], [ticker], engine)
+    fixed = repair_share_scale(*(sh[sh["metric"] == m] for m in (SHARES, NET_INCOME, EPS)))
+    shares = build_latest(fixed, sp, shares=True, value_col="shares")
     print(f"\n── {ticker} μετοχές (diluted, μέσος όρος περιόδου, σε σημερινές μετοχές) ──")
+    if fixed.attrs["repaired"]:
+        print(f"  ⚠️ διορθώθηκε η κλίμακα σε {len(fixed.attrs['repaired'])} γραμμές (NI / EPS):")
+        print(pd.DataFrame(fixed.attrs["repaired"]).to_string(index=False))
     bad = pd.DataFrame(shares.attrs.get("dropped", []))
     if len(bad):
         print(f"  ⚠️ απορρίφθηκαν {len(bad)} γραμμές ως λάθος κλίμακας (π.χ. χιλιάδες αντί για μονάδες):")
