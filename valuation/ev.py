@@ -25,7 +25,36 @@ anything twice. On one balance-sheet date:
   Only a TOTAL tag (LongTermDebt 43) → use it; never LongTermDebt + LongTermDebtCurrent
   (that would count the 3 bn twice).
 
-CASH = cash & equivalents + short-term investments (if tagged).
+CASH = cash & equivalents + the LARGEST "current" securities tag (Nov 2026).
+  The securities tags overlap as part and whole, so they are never summed.
+  PFE 2026-06: cash 0.98 + short-term investments 10.72 = 11.70 = Yahoo, while
+  the debt-securities tag (7.28) is PART of the 10.72. Measured on 203 non-
+  financial companies vs Yahoo, within 5%: cash + ShortTermInvestments 141,
+  sum of all current tags 185, largest current tag 190.
+  Two guards (dev/history_check_202611.py):
+    - the company's own "cash + short-term investments" total equals cash
+      ALONE → the securities are already inside cash, add nothing
+      (TGT 2019: 1.556 + 0.769 would count 0.77 bn twice; 65 dates, 14 companies);
+    - a date with no securities tag right after a date that had one is
+      skipped, so the previous value stays (NVDA 10-K 2026-01: 43 bn of
+      securities untagged → a fake 78% drop; 45 dates, 35 companies).
+  No cash line at all → the company's own total, alone.
+
+CONVERTIBLE DEBT (Nov 2026) is used ALONE only when (a) no ordinary debt rule
+applies on that date, (b) the convertibles are above zero, and (c) every
+ordinary debt figure the company reported before was just its convertibles
+(at most 10% above them on the same date). DXCM, DDOG, AKAM, DASH: the
+convertibles are all their debt. PANW: its old LongTermDebt 1.99 was the
+convertibles themselves, so (c) holds.
+  (c) keeps out BXP: ordinary debt 3.30 years ago with no convertibles, today
+  0.98 of convertibles vs ~15.6 bn of debt in tags we don't read. A 2-year
+  window was tried first and let BXP through (regression of 09/11/2026).
+  (b): a stated 0 of convertibles means "no convertibles", not "no debt"
+  (EXR 2020: a REIT with billions of debt would have shown 0).
+When ordinary debt exists, it is used alone, as before: in history the
+convertibles were inside it about as often as outside (20 vs 18 moves, CRM
+both), so adding them would double count half the time. Known undercount:
+MIR, MOH, TYL, VIAV.
 
 Not included (standard simplifications, said out loud): operating leases,
 preferred stock, minority interests. For BANKS and INSURERS EV/EBIT has no
@@ -43,10 +72,26 @@ from . import yields as Y
 EBIT = "OperatingIncomeLoss"
 CASH = "CashAndCashEquivalentsAtCarryingValue"
 STI = "ShortTermInvestments"
+COMBINED = "CashCashEquivalentsAndShortTermInvestments"     # cash INCLUDED: never added to cash
+SECURITIES = [STI, "MarketableSecuritiesCurrent", "DebtSecuritiesCurrent",
+              "AvailableForSaleSecuritiesDebtSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent",
+              "OtherShortTermInvestments",
+              "DebtSecuritiesAvailableForSaleExcludingAccruedInterestCurrent"]
+CASH_METRICS = [CASH, COMBINED] + SECURITIES
+SAME_TOTAL = 0.01               # company total within 1% of cash alone → securities inside cash
+SECURITIES_GAP_DAYS = 200       # "the date before" = at most ~2 quarters back
+CONV_NONCURRENT = ["ConvertibleLongTermNotesPayable", "ConvertibleDebtNoncurrent",
+                   "ConvertibleSubordinatedDebtNoncurrent"]
+CONV_CURRENT = ["ConvertibleNotesPayableCurrent", "ConvertibleDebtCurrent",
+                "ConvertibleSubordinatedDebtCurrent"]
+CONV_TOTAL = ["ConvertibleDebt", "ConvertibleNotesPayable", "ConvertibleSubordinatedDebt"]
+CONV_METRICS = CONV_NONCURRENT + CONV_CURRENT + CONV_TOTAL
+CONV_MATCH = 1.10               # past ordinary debt ≤ 110% of the convertibles = "it was them"
 DEBT_NONCURRENT = ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations"]
 DEBT_CURRENT = ["DebtCurrent", "LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent"]
 DEBT_TOTAL = ["LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities", "LongTermDebt"]
 DEBT_METRICS = DEBT_NONCURRENT + DEBT_CURRENT + DEBT_TOTAL
+ALL_DEBT_METRICS = DEBT_METRICS + CONV_METRICS
 FINANCIAL_SECTORS = {"Financial Services"}
 
 
@@ -74,10 +119,44 @@ def _first(row: pd.Series, names: list[str]):
     return None, None
 
 
+def convertibles(row: pd.Series):
+    """
+    Convertible debt on one date → (value, tags used), or (None, []) without a tag.
+    Non-current + current part; a total only when neither part exists.
+    Example: ConvertibleLongTermNotesPayable 1.24 + ConvertibleNotesPayableCurrent 0 = 1.24.
+    """
+    nc_name, nc = _first(row, CONV_NONCURRENT)
+    cur_name, cur = _first(row, CONV_CURRENT)
+    if nc is not None or cur is not None:
+        return (nc or 0.0) + (cur or 0.0), [n for n in (nc_name, cur_name) if n]
+    tot_name, tot = _first(row, CONV_TOTAL)
+    return (tot, [tot_name]) if tot is not None else (None, [])
+
+
+def _convertibles_were_all_the_debt(val: pd.DataFrame, pe) -> bool:
+    """
+    On every date up to `pe` with ordinary debt above zero, was that debt just the
+    convertibles (≤ CONV_MATCH × convertibles of the same date)? Only the past is
+    looked at, so the answer was knowable on that date.
+    PANW: LongTermDebt 1.99, convertibles 1.99 → yes.  BXP: LongTermDebt 3.30,
+    no convertibles that day → no.
+    """
+    cols = [c for c in DEBT_METRICS if c in val.columns]
+    if not cols:
+        return True
+    past = val.loc[val.index <= pe]
+    ordinary = past[cols].where(past[cols] > 0).max(axis=1)
+    for d, o in ordinary.dropna().items():
+        conv, _ = convertibles(past.loc[d])
+        if conv is None or o > CONV_MATCH * conv:
+            return False
+    return True
+
+
 def debt_series(rows: pd.DataFrame) -> pd.DataFrame:
     """
     Total debt per balance-sheet date → columns period_end, available, debt, method.
-    `rows` = output of load_metric for DEBT_METRICS, with a `metric` column.
+    `rows` = output of load_metrics for ALL_DEBT_METRICS (DEBT_METRICS alone works too).
     Dates where no rule applies are dropped, so the previous known value
     stays in force (up to MAX_TTM_AGE_DAYS) instead of becoming 0.
     """
@@ -108,7 +187,11 @@ def debt_series(rows: pd.DataFrame) -> pd.DataFrame:
             # missing tag on one date would turn 43 bn of debt into 5 bn.
             debt, used, method = cur, [cur_name], f"{cur_name} (μόνο βραχυπρόθεσμο)"
         else:
-            continue
+            conv, conv_used = convertibles(row)
+            if conv is None or conv <= 0 or not _convertibles_were_all_the_debt(val, pe):
+                continue
+            debt, used = conv, conv_used
+            method = f"μόνο μετατρέψιμα ({' + '.join(conv_used)})"
         available = max(filed.loc[pe, u] for u in used) + pd.Timedelta(days=1)
         out.append({"period_end": pe, "available": available, "debt": debt, "method": method})
     if not out:
@@ -116,20 +199,56 @@ def debt_series(rows: pd.DataFrame) -> pd.DataFrame:
     return newest_only(pd.DataFrame(out, columns=cols))
 
 
+def securities(row: pd.Series):
+    """The LARGEST current securities tag on one date → (value, tag), or (None, None) without one."""
+    best = (None, None)
+    for n in SECURITIES:
+        v = row.get(n)
+        if v is not None and pd.notna(v) and (best[0] is None or float(v) > best[0]):
+            best = (float(v), n)
+    return best
+
+
 def cash_series(rows: pd.DataFrame) -> pd.DataFrame:
-    """Cash + short-term investments per date → period_end, available, cash."""
-    cols = ["period_end", "available", "cash"]
+    """
+    Cash + securities per balance-sheet date → period_end, available, cash, method.
+    `rows` = output of load_metrics for CASH_METRICS (see the module docstring).
+    Example: cash 2.0, MarketableSecuritiesCurrent 3.0, AFS debt securities 2.5
+    (part of the 3.0) → 2.0 + 3.0 = 5.0, never 7.5.
+    """
+    cols = ["period_end", "available", "cash", "method"]
     if rows.empty:
         return pd.DataFrame(columns=cols)
     val, filed = _wide(rows)
-    if CASH not in val.columns:
+    out, had_securities, prev_date = [], False, None
+    for pe, row in val.sort_index().iterrows():
+        cash = row.get(CASH)
+        comb = row.get(COMBINED)
+        has_cash = cash is not None and pd.notna(cash)
+        has_comb = comb is not None and pd.notna(comb)
+        if not has_cash and not has_comb:
+            continue
+        sec, sec_name = securities(row)
+        recent = prev_date is not None and (pe - prev_date).days <= SECURITIES_GAP_DAYS
+        gap = sec is None and had_securities and recent
+        prev_date, had_securities = pe, sec is not None and sec > 0
+        if not has_cash:
+            total, used, method = float(comb), [COMBINED], COMBINED
+        elif has_comb and comb > 0 and abs(float(cash) / float(comb) - 1) <= SAME_TOTAL:
+            total, used, method = float(cash), [CASH, COMBINED], "ταμείο (τα χρεόγραφα είναι μέσα σε αυτό)"
+        elif gap:
+            # securities in the quarter before, none tagged now: keep the previous value.
+            # Only once: if the next date has none either, the company really sold them.
+            continue
+        elif sec is None:
+            total, used, method = float(cash), [CASH], "ταμείο (χωρίς χρεόγραφα)"
+        else:
+            total, used, method = float(cash) + sec, [CASH, sec_name], f"ταμείο + {sec_name}"
+        available = max(filed.loc[pe, u] for u in used) + pd.Timedelta(days=1)
+        out.append({"period_end": pe, "available": available, "cash": total, "method": method})
+    if not out:
         return pd.DataFrame(columns=cols)
-    v = val[val[CASH].notna()]
-    sti = v[STI].fillna(0.0) if STI in v.columns else 0.0
-    out = pd.DataFrame({"period_end": v.index, "cash": (v[CASH] + sti).to_numpy(),
-                        "available": filed.loc[v.index, CASH].to_numpy()})
-    out["available"] = pd.to_datetime(out["available"]) + pd.Timedelta(days=1)
-    return newest_only(out[cols])
+    return newest_only(pd.DataFrame(out, columns=cols))
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -159,8 +278,8 @@ def ev_history(ticker: str, engine, years: int = 10, as_of=None,
     if d.empty:
         return EVHistory(ticker, d, base.status, "")
 
-    debt_rows = _load_many(DEBT_METRICS, ticker, engine, as_of)
-    cash_rows = _load_many([CASH, STI], ticker, engine, as_of)
+    debt_rows = _load_many(ALL_DEBT_METRICS, ticker, engine, as_of)
+    cash_rows = _load_many(CASH_METRICS, ticker, engine, as_of)
     ebit = build_ttm(load_metric(EBIT, [ticker], engine, as_of=as_of), value_col="ebit_ttm")
 
     debt = debt_series(debt_rows)
@@ -232,7 +351,7 @@ def print_ev_summary(h: EVHistory) -> None:
 
 def debug_ev(ticker: str, engine) -> None:
     """Every balance-sheet tag on the latest dates, the debt rule chosen, and a Yahoo cross-check."""
-    rows = _load_many(DEBT_METRICS + [CASH, STI], ticker, engine, None)
+    rows = _load_many(ALL_DEBT_METRICS + CASH_METRICS, ticker, engine, None)
     if rows.empty:
         print(f"{ticker}: κανένα tag χρέους/ταμείου.")
     else:
@@ -240,7 +359,7 @@ def debug_ev(ticker: str, engine) -> None:
         t = val.tail(3).T.map(lambda v: "—" if pd.isna(v) else _fmt(v))
         print(f"── {ticker}: tags ισολογισμού, τελευταίες 3 ημερομηνίες ──")
         print(t.to_string())
-        ds = debt_series(rows[rows["metric"].isin(DEBT_METRICS)])
+        ds = debt_series(rows[rows["metric"].isin(ALL_DEBT_METRICS)])
         if not ds.empty:
             x = ds.tail(3).copy()
             x["debt"] = x["debt"].map(_fmt)
