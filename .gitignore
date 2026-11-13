@@ -10,3 +10,4 @@ data/
 fundamendals_repair_08-2026/
 # charts saved from notebooks
 /*.png
+peer_data/peer_yields_test.csv
