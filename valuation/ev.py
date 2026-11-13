@@ -39,6 +39,15 @@ CASH = cash & equivalents + the LARGEST "current" securities tag (Nov 2026).
       skipped, so the previous value stays (NVDA 10-K 2026-01: 43 bn of
       securities untagged → a fake 78% drop; 45 dates, 35 companies).
   No cash line at all → the company's own total, alone.
+  Else, cash INCLUDING restricted cash (Nov 2026, trading-shared-data v0.1.27):
+  since 2018 many companies tag only that total in their 10-Qs (PG since 2019,
+  MMM since 2017, HSY, LULU, DHR, CSX, SBUX...). Restricted cash is not
+  spendable, so it is used only if THIS company's past shows the two equal:
+  on at least 2 earlier dates with both tags, never more than 5% apart.
+  Example: PG 2019, cash 10.0 and cash+restricted 10.0 → from 2019 on its
+  cash+restricted counts as cash. ADP (client funds, ×13) or WAB (+419%) never.
+  On 700 companies with both tags, 252 differ by more than 5%: hence per company.
+  Measured in dev/restricted_cash_202611.py: 58 of 78 testable companies ≤ 2%.
 
 CONVERTIBLE DEBT (Nov 2026) is used ALONE only when (a) no ordinary debt rule
 applies on that date, (b) the convertibles are above zero, and (c) every
@@ -77,7 +86,11 @@ SECURITIES = [STI, "MarketableSecuritiesCurrent", "DebtSecuritiesCurrent",
               "AvailableForSaleSecuritiesDebtSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent",
               "OtherShortTermInvestments",
               "DebtSecuritiesAvailableForSaleExcludingAccruedInterestCurrent"]
-CASH_METRICS = [CASH, COMBINED] + SECURITIES
+RESTRICTED = ["CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+              "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsIncludingDisposalGroupAndDiscontinuedOperations"]
+RESTRICTED_MATCH = 0.05         # past dates: cash+restricted within 5% of cash...
+RESTRICTED_MIN_DATES = 2        # ...on at least 2 of them
+CASH_METRICS = [CASH, COMBINED] + SECURITIES + RESTRICTED
 SAME_TOTAL = 0.01               # company total within 1% of cash alone → securities inside cash
 SECURITIES_GAP_DAYS = 200       # "the date before" = at most ~2 quarters back
 CONV_NONCURRENT = ["ConvertibleLongTermNotesPayable", "ConvertibleDebtNoncurrent",
@@ -209,6 +222,18 @@ def securities(row: pd.Series):
     return best
 
 
+def _restricted_ok(val: pd.DataFrame, tag: str, pe) -> bool:
+    """Was `tag` (cash incl. restricted) within RESTRICTED_MATCH of cash on at least
+    RESTRICTED_MIN_DATES dates up to `pe`? Only the past is looked at."""
+    if tag not in val.columns or CASH not in val.columns:
+        return False
+    past = val.loc[val.index <= pe, [CASH, tag]].dropna()
+    past = past[past[CASH] > 0]
+    if len(past) < RESTRICTED_MIN_DATES:
+        return False
+    return bool(((past[tag] / past[CASH] - 1).abs() <= RESTRICTED_MATCH).all())
+
+
 def cash_series(rows: pd.DataFrame) -> pd.DataFrame:
     """
     Cash + securities per balance-sheet date → period_end, available, cash, method.
@@ -226,6 +251,13 @@ def cash_series(rows: pd.DataFrame) -> pd.DataFrame:
         comb = row.get(COMBINED)
         has_cash = cash is not None and pd.notna(cash)
         has_comb = comb is not None and pd.notna(comb)
+        cash_tag, label = CASH, "ταμείο"
+        if not has_cash and not has_comb:
+            for tag in RESTRICTED:
+                v = row.get(tag)
+                if v is not None and pd.notna(v) and _restricted_ok(val, tag, pe):
+                    cash, has_cash, cash_tag, label = v, True, tag, "ταμείο με δεσμευμένα"
+                    break
         if not has_cash and not has_comb:
             continue
         sec, sec_name = securities(row)
@@ -235,15 +267,15 @@ def cash_series(rows: pd.DataFrame) -> pd.DataFrame:
         if not has_cash:
             total, used, method = float(comb), [COMBINED], COMBINED
         elif has_comb and comb > 0 and abs(float(cash) / float(comb) - 1) <= SAME_TOTAL:
-            total, used, method = float(cash), [CASH, COMBINED], "ταμείο (τα χρεόγραφα είναι μέσα σε αυτό)"
+            total, used, method = float(cash), [cash_tag, COMBINED], f"{label} (τα χρεόγραφα είναι μέσα σε αυτό)"
         elif gap:
             # securities in the quarter before, none tagged now: keep the previous value.
             # Only once: if the next date has none either, the company really sold them.
             continue
         elif sec is None:
-            total, used, method = float(cash), [CASH], "ταμείο (χωρίς χρεόγραφα)"
+            total, used, method = float(cash), [cash_tag], f"{label} (χωρίς χρεόγραφα)"
         else:
-            total, used, method = float(cash) + sec, [CASH, sec_name], f"ταμείο + {sec_name}"
+            total, used, method = float(cash) + sec, [cash_tag, sec_name], f"{label} + {sec_name}"
         available = max(filed.loc[pe, u] for u in used) + pd.Timedelta(days=1)
         out.append({"period_end": pe, "available": available, "cash": total, "method": method})
     if not out:

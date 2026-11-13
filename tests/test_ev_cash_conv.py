@@ -146,3 +146,59 @@ def test_convertible_parts_beat_the_total():
     assert E.convertibles(pd.Series({CLT: 2.0, CNC: 1.0, "ConvertibleDebt": 3.0}))[0] == 3.0
     assert E.convertibles(pd.Series({"ConvertibleDebt": 3.0}))[0] == 3.0
     assert E.convertibles(pd.Series({LTD: 3.0}))[0] is None
+
+
+# ── cash including restricted cash (v0.1.27 tags) ─────────────────────────
+
+RC = E.RESTRICTED[0]
+RC2 = E.RESTRICTED[1]
+
+
+def test_restricted_total_used_when_cash_stops_and_history_agrees():
+    # PG: both tags equal until 2019, then only cash+restricted
+    t = {"2019-03-31": {C: 10.0, RC: 10.0}, "2019-06-30": {C: 10.2, RC: 10.25},
+         "2026-09-30": {RC: 15.4}}
+    assert cash(t)[T("2026-09-30")] == 15.4
+    d = E.cash_series(rows(t))
+    assert d["method"].iloc[-1].startswith("ταμείο με δεσμευμένα")
+
+
+def test_restricted_total_never_used_when_history_differs():
+    # WAB / ADP: restricted cash is a big part → no cash at all on the later date
+    t = {"2019-03-31": {C: 1.0, RC: 5.0}, "2019-06-30": {C: 1.0, RC: 5.2}, "2026-09-30": {RC: 6.0}}
+    assert T("2026-09-30") not in cash(t)
+
+
+def test_restricted_total_needs_two_past_dates():
+    t = {"2019-03-31": {C: 10.0, RC: 10.0}, "2026-09-30": {RC: 15.4}}
+    assert T("2026-09-30") not in cash(t)
+
+
+def test_restricted_total_never_replaces_a_cash_line_that_exists():
+    t = {"2019-03-31": {C: 10.0, RC: 10.0}, "2019-06-30": {C: 10.0, RC: 10.0},
+         "2026-09-30": {C: 12.0, RC: 30.0}}
+    assert cash(t)[T("2026-09-30")] == 12.0
+
+
+def test_company_total_beats_the_restricted_total():
+    # TGT: no cash line, but its own cash + short-term investments total
+    t = {"2019-03-31": {C: 10.0, RC: 10.0}, "2019-06-30": {C: 10.0, RC: 10.0},
+         "2026-09-30": {COMB: 5.4, RC: 5.6}}
+    assert cash(t)[T("2026-09-30")] == 5.4
+
+
+def test_securities_are_added_to_the_restricted_total_too():
+    t = {"2019-03-31": {C: 10.0, RC: 10.0}, "2019-06-30": {C: 10.0, RC: 10.0},
+         "2026-09-30": {RC: 4.8, MSC: 0.3}}
+    assert cash(t)[T("2026-09-30")] == 4.8 + 0.3
+
+
+def test_only_the_past_counts_for_the_restricted_guard():
+    # agreement that appears only LATER must not unlock an earlier date
+    t = {"2018-06-30": {RC: 9.0}, "2019-03-31": {C: 10.0, RC: 10.0}, "2019-06-30": {C: 10.0, RC: 10.0}}
+    assert T("2018-06-30") not in cash(t)
+
+
+def test_disposal_group_variant_when_the_plain_total_is_missing():
+    t = {"2019-03-31": {C: 10.0, RC2: 10.0}, "2019-06-30": {C: 10.0, RC2: 10.1}, "2026-09-30": {RC2: 4.8}}
+    assert cash(t)[T("2026-09-30")] == 4.8
