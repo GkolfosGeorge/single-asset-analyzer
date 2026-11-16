@@ -3,9 +3,10 @@ valuation/quick.py — a FAST, stock-only valuation card for automated
 messages (the mean reversion daily mail).
 
 Differences from the notebook:
-  - NO peers: the sector line needs prices for ~100 companies (slow) and is
-    not trusted before Βήμα 3 anyway. Every comparison is with the stock's
-    OWN 10-year history.
+  - Peers come from the WEEKLY table (peer_data/peer_yields.csv, built by
+    jobs/build_peer_table.py): one line "🏷️ Κλάδος" compares today's yields
+    with the peers' yields of up to a week ago (valuation/peers.py). All other
+    comparisons are with the stock's OWN 10-year history.
   - EVERY part fails on its own. A missing tag, a bank without EBIT, an ETF
     that isn't in the SEC database, Yahoo hiccups: that part is left out of
     the card, the rest still shows. quick_snapshot() never raises.
@@ -24,6 +25,7 @@ import pandas as pd
 
 from . import ev as E
 from . import pe as P
+from . import peers as PEERS
 from . import yields as Y
 from .ttm import load_prices
 
@@ -31,6 +33,11 @@ CHEAP_PCT, EXPENSIVE_PCT = 75, 25          # same thresholds as snapshot.py
 EARNINGS_SOON_DAYS = 14                    # warn if results are this close
 RECENT_REPORT_DAYS = 7                     # "results came out N days ago"
 CAPEX_JUMP_X = 1.5                         # capex TTM ×1.5 in a year → mention it
+PEER_TABLE_URL = ("https://raw.githubusercontent.com/GkolfosGeorge/single-asset-analyzer/"
+                  "main/peer_data/peer_yields.csv")
+PEER_TABLE_LOCAL = "peer_data/peer_yields.csv"
+PEER_MAX_AGE_DAYS = 14                     # an older table (job failing for 2 weeks) is not shown
+PEER_METRICS = [("earnings_yield", "P/E"), ("ebit_yield", "EV/EBIT"), ("fcf_yield", "FCF")]
 
 # Piotroski criteria in the same order/groups as quality_scores/piotroski.py.
 # (kept here as plain names so this module imports without quality_scores)
@@ -86,6 +93,8 @@ class QuickSnapshot:
     days_since_report: int | None = None
     days_to_earnings: int | None = None
     financial: bool = False                   # bank/insurer: EV/EBIT, FCF don't apply
+    yields: dict[str, float] = field(default_factory=dict)   # today's E/P, EBIT/EV, FCF yield
+    peer: dict | None = None                  # see peer_comparison()
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -96,6 +105,64 @@ class QuickSnapshot:
 # ═════════════════════════════════════════════════════════════════════════
 # 1. BUILD
 # ═════════════════════════════════════════════════════════════════════════
+
+_PEER_TABLE = {}
+
+
+def load_peer_table() -> pd.DataFrame:
+    """The weekly table: the local copy if there is one (notebook), else GitHub (mail). Read once."""
+    if "t" not in _PEER_TABLE:
+        import os
+        src = os.environ.get("SAA_PEER_TABLE") or (PEER_TABLE_LOCAL if os.path.exists(PEER_TABLE_LOCAL)
+                                                    else PEER_TABLE_URL)
+        _PEER_TABLE["t"] = pd.read_csv(src)
+    return _PEER_TABLE["t"]
+
+
+def peer_comparison(ticker: str, own: dict, financial: bool, table: pd.DataFrame,
+                    today: pd.Timestamp) -> dict | None:
+    """
+    Today's yields of `ticker` against its peers in the weekly table →
+    {"group", "level", "size", "zones": {"P/E": ("φθηνή", 0.71, 13), ...}, "as_of"} or None.
+    Example: EBIT/EV 6.5% vs 7 peers at 1,2,3,4,6,7,8% → cheaper than 5 of 7 → "φθηνή".
+    A loss (E/P ≤ 0) shows as "P/E ζημιές", not "P/E ακριβή" (Ford, Nov 2026).
+    None when: the table is older than PEER_MAX_AGE_DAYS, the company isn't in it,
+    or it has no peer group (even its sector is too small).
+    """
+    if table is None or table.empty:
+        return None
+    as_of = pd.to_datetime(table["as_of"]).max()
+    if (today - as_of).days > PEER_MAX_AGE_DAYS:
+        return None
+    t = table.drop_duplicates("ticker").set_index("ticker")
+    if ticker not in t.index:
+        return None
+    cls = {k: {"sector": r["sector"], "industry": r["industry"]} for k, r in t.iterrows()
+           if isinstance(r["sector"], str) and isinstance(r["industry"], str)}
+    groups = PEERS.peer_groups(cls)
+    row = groups[groups["ticker"] == ticker]
+    if row.empty or row["level"].iloc[0] == "—":
+        return None
+    peers = [m for m in PEERS.members(groups, ticker) if m != ticker]
+    zones = {}
+    for col, name in PEER_METRICS:
+        if financial and col != "earnings_yield":
+            continue
+        z, share, n = PEERS.zone(own.get(col), t.loc[peers, col])
+        if z and col == "earnings_yield" and own[col] <= 0:
+            z, share = "ζημιές", None          # a loss is not "expensive": P/E has no meaning
+        if z:
+            zones[name] = (z, share, n)
+    return {"group": row["group"].iloc[0], "level": row["level"].iloc[0],
+            "size": int(row["size"].iloc[0]), "zones": zones, "as_of": as_of.date().isoformat()}
+
+
+def _last_yield(d: pd.DataFrame, col: str, end: pd.Timestamp):
+    s = d[col].dropna() if col in d.columns else pd.Series(dtype=float)
+    if s.empty or s.index[-1] < end - timedelta(days=10):
+        return None
+    return float(s.iloc[-1])
+
 
 def _own_metric(s: pd.Series, lower_is_cheaper: bool) -> Metric | None:
     hist = pd.to_numeric(s, errors="coerce").dropna()
@@ -154,6 +221,8 @@ def quick_snapshot(ticker: str, engine, years: int = 10, as_of=None,
         if d.empty:
             return
         snap.pe = _own_metric(d["pe"], lower_is_cheaper=True)
+        ey = (d["eps_ttm"] / d["close"]).rename("earnings_yield").to_frame()
+        snap.yields["earnings_yield"] = _last_yield(ey, "earnings_yield", end)
         now, ago = d["eps_ttm"].dropna(), _value_year_ago(d["eps_ttm"], end)
         if len(now):
             snap.eps_negative = bool(now.iloc[-1] <= 0)
@@ -168,6 +237,7 @@ def quick_snapshot(ticker: str, engine, years: int = 10, as_of=None,
             return
         d = fcf.daily
         snap.fcf_yield = _own_metric(d["fcf_yield"], lower_is_cheaper=False)
+        snap.yields["fcf_yield"] = _last_yield(d, "fcf_yield", end)
         dps = d["div_ps_365d"].iloc[-1]
         if pd.notna(dps) and d["close"].iloc[-1] > 0:
             snap.div_yield = float(dps / d["close"].iloc[-1])
@@ -177,6 +247,7 @@ def quick_snapshot(ticker: str, engine, years: int = 10, as_of=None,
         ev = E.ev_history(ticker, engine, as_of=as_of, base=fcf)
         if not ev.daily.empty:
             snap.ev_ebit = _own_metric(ev.daily["ev_ebit"], lower_is_cheaper=True)
+            snap.yields["ebit_yield"] = _last_yield(ev.daily, "ebit_yield", end)
         # Banks/insurers have NEITHER operating income NOR capex. "No EBIT" alone
         # is not enough: oil majors (CVX, XOM) don't report an operating-income
         # line either, but they do have capex.
@@ -193,6 +264,11 @@ def quick_snapshot(ticker: str, engine, years: int = 10, as_of=None,
             snap.fscore_detail = dict(r.breakdown)
             snap.fscore_flags = [(f.criterion, f.text("el")) for f in red_flags(r)]
     part("F-Score", _fscore)
+
+    # ── Peers (weekly table; only for today: the table is not point-in-time) ──
+    if as_of is None:
+        part("κλάδος", lambda: setattr(snap, "peer", peer_comparison(
+            ticker, snap.yields, snap.financial, load_peer_table(), end)))
 
     if with_earnings_date and as_of is None:
         part("earnings date", lambda: setattr(snap, "days_to_earnings", _next_earnings_days(ticker, end)))
@@ -262,6 +338,10 @@ def format_card(snap: QuickSnapshot, indent: str = "  ") -> list[str]:
              _metric_txt("EV/EBIT", None if snap.financial else snap.ev_ebit, ".0f"),
              _metric_txt("FCF", None if snap.financial else snap.fcf_yield, ".1%")]
     lines.append(f"{indent}💰 {emoji} {phrase}   " + " · ".join(p for p in parts if p))
+    if snap.peer and snap.peer["zones"]:
+        where = snap.peer["group"] if snap.peer["level"] != "τομέας" else f"τομέας {snap.peer['group']}"
+        z = " · ".join(f"{name} {zone}" for name, (zone, _, _) in snap.peer["zones"].items())
+        lines.append(f"{indent}🏷️ Κλάδος: {where} ({snap.peer['size']}): {z}")
 
     q = []
     if snap.eps_negative:
@@ -334,7 +414,9 @@ def format_line(snap: QuickSnapshot, indent: str = "  ") -> list[str]:
 def legend() -> list[str]:
     out = [
         "Θεμελιώδη: 🟢 φθηνή / 🟡 κανονική ή μικτή / 🔴 ακριβή = σε σχέση με το ΔΙΚΟ της",
-        "10ετές ιστορικό (P/E, EV/EBIT, FCF yield), όχι με τον κλάδο.",
+        "10ετές ιστορικό (P/E, EV/EBIT, FCF yield).",
+        "🏷️ Κλάδος = σύγκριση με ομοειδείς (κλάδος ή ομάδα συγγενικών κλάδων, ≥ 8 εταιρείες):",
+        "   φθηνή / ακριβή = φθηνότερη / ακριβότερη από τα 2/3 τους· τιμές ομοειδών ως 1 εβδομάδας.",
         "🩺 Υγεία = Piotroski F-Score, φέτος vs πέρσι (7–9 υγιής, 4–6 μέτρια, 0–3 αδύναμη).",
         "   ✓ πέρασε · ✗ κόπηκε · – δεν αξιολογήθηκε (λείπουν δεδομένα). Σειρά ανά ομάδα:",
     ]
