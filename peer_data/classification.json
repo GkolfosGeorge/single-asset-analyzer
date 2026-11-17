@@ -2807,6 +2807,18 @@
   "ZTS": {
    "sector": "Healthcare",
    "industry": "Drug Manufacturers - Specialty & Generic"
+  },
+  "SKYD": {
+   "sector": "Communication Services",
+   "industry": "Entertainment"
+  },
+  "VMRK": {
+   "sector": "Real Estate",
+   "industry": "REIT - Residential"
+  },
+  "VYLR": {
+   "sector": "Financial Services",
+   "industry": "Shell Companies"
   }
  },
  "_failed": {
