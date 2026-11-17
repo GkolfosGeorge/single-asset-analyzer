@@ -12,6 +12,10 @@ Locally, for a quick look:
 Safety: the full table replaces the old one ONLY if at least MIN_COVERAGE
 companies got a yield; a broken run (Yahoo down, database down) leaves last
 week's table in place and fails loudly.
+
+Dead tickers (merged, acquired, renamed, recycled) are left out BEFORE the
+table is built, using today's SEC list (valuation/universe.py, Nov 2026); the
+ones left out are listed in peer_data/excluded.csv.
 """
 
 import os
@@ -24,6 +28,7 @@ OUT_DIR = "peer_data"
 OUT = os.path.join(OUT_DIR, "peer_yields.csv")
 TEST_OUT = os.path.join(OUT_DIR, "peer_yields_test.csv")
 CLASSIFICATION = os.path.join(OUT_DIR, "classification.json")
+EXCLUDED = os.path.join(OUT_DIR, "excluded.csv")
 MIN_COVERAGE = 500
 
 
@@ -31,6 +36,7 @@ def main() -> None:
     from db import get_engine
     from valuation.pe import get_classification, load_universe
     from valuation.peer_table import build, coverage
+    from valuation.universe import live_tickers, load_companies, load_sec
 
     limit = None
     if "--limit" in sys.argv:
@@ -39,6 +45,8 @@ def main() -> None:
 
     eng = get_engine()
     tickers = load_universe(eng)
+    tickers, dropped, msg = live_tickers(tickers, load_companies(eng), load_sec())
+    print(msg, flush=True)
     if limit:
         tickers = tickers[:limit]
     t0 = time.time()
@@ -58,7 +66,8 @@ def main() -> None:
     if n < MIN_COVERAGE:
         sys.exit(f"❌ Μόνο {n} εταιρείες με απόδοση (< {MIN_COVERAGE}): ο παλιός πίνακας μένει.")
     table.to_csv(OUT, index=False)
-    print(f"→ {OUT}")
+    dropped[["ticker", "status", "title", "sec_tickers", "sec_title"]].to_csv(EXCLUDED, index=False)
+    print(f"→ {OUT} · {EXCLUDED}")
 
 
 if __name__ == "__main__":
