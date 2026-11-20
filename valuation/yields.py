@@ -46,7 +46,29 @@ CAPEX_TAGS = [
     "PaymentsForCapitalImprovements",
 ]
 SHARES = "WeightedAverageNumberOfDilutedSharesOutstanding"
+SHARES_BASIC = "WeightedAverageNumberOfSharesOutstandingBasic"   # fallback, v0.1.7
 NET_INCOME, EPS = "NetIncomeLoss", "EarningsPerShareDiluted"   # yardstick for the share scale
+
+
+def with_basic_fallback(diluted: pd.DataFrame, basic: pd.DataFrame) -> pd.DataFrame:
+    """
+    Diluted share rows, plus BASIC rows for periods that have no diluted row (v0.1.7, Nov 2026).
+    Some filers tag only the basic weighted average when basic = diluted: XOM since its
+    new CIK (2026) reports EPS basic = diluted = 8.18 and only basic shares, so without
+    this the card had no market cap at all.
+    A period is (period_start, period_end); where both exist, diluted always wins, so
+    companies that file both are unchanged. Basic ≤ diluted, so a filled period can
+    understate the share count by the dilution (usually < 1–2%).
+    """
+    if basic is None or basic.empty:
+        return diluted
+    if diluted is None or diluted.empty:
+        return basic.copy()
+    key = ["period_start", "period_end"]
+    have = diluted[key].drop_duplicates()
+    extra = basic.merge(have, on=key, how="left", indicator=True)
+    extra = extra[extra["_merge"] == "left_only"].drop(columns="_merge")
+    return pd.concat([diluted, extra], ignore_index=True)
 SPLIT_LOOKBACK_DAYS = 500
 
 
@@ -141,12 +163,13 @@ def fcf_history(ticker: str, engine, years: int = 10, as_of=None) -> FCFHistory:
     if ticker not in close.columns or close[ticker].dropna().empty:
         return FCFHistory(ticker, pd.DataFrame(), "χωρίς τιμές (yfinance)")
     sp = splits[ticker] if ticker in splits.columns else None
-    tags = [CFO, SHARES, NET_INCOME, EPS] + CAPEX_TAGS
+    tags = [CFO, SHARES, SHARES_BASIC, NET_INCOME, EPS] + CAPEX_TAGS
     allrows = load_metrics(tags, [ticker], engine, as_of=as_of)  # ONE query
     rows = {m: allrows[allrows["metric"] == m] for m in tags}
     capex_rows = {m: rows[m] for m in CAPEX_TAGS}
 
-    shares_rows = repair_share_scale(rows[SHARES], rows[NET_INCOME], rows[EPS])
+    shares_rows = repair_share_scale(with_basic_fallback(rows[SHARES], rows[SHARES_BASIC]),
+                                     rows[NET_INCOME], rows[EPS])
     shares = build_latest(shares_rows, sp, shares=True, value_col="shares")
     fcf = fcf_ttm(rows[CFO], capex_rows)
     d = build_daily(close[ticker], shares, fcf)
@@ -236,8 +259,9 @@ def debug_fcf(ticker: str, engine, n: int = 5) -> None:
         for l in bad:
             print("  " + l)
 
-    sh = load_metrics([SHARES, NET_INCOME, EPS], [ticker], engine)
-    fixed = repair_share_scale(*(sh[sh["metric"] == m] for m in (SHARES, NET_INCOME, EPS)))
+    sh = load_metrics([SHARES, SHARES_BASIC, NET_INCOME, EPS], [ticker], engine)
+    m_ = {m: sh[sh["metric"] == m] for m in (SHARES, SHARES_BASIC, NET_INCOME, EPS)}
+    fixed = repair_share_scale(with_basic_fallback(m_[SHARES], m_[SHARES_BASIC]), m_[NET_INCOME], m_[EPS])
     shares = build_latest(fixed, sp, shares=True, value_col="shares")
     print(f"\n── {ticker} μετοχές (diluted, μέσος όρος περιόδου, σε σημερινές μετοχές) ──")
     if fixed.attrs["repaired"]:
