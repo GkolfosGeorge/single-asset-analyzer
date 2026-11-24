@@ -23,6 +23,7 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 
+from . import earnings_mcap as EM
 from . import ev as E
 from . import pe as P
 from . import peers as PEERS
@@ -81,6 +82,7 @@ class Metric:
 class QuickSnapshot:
     ticker: str
     pe: Metric | None = None
+    pe_now: float | None = None              # P/E today from net income / market cap (no history), v0.1.8
     ev_ebit: Metric | None = None
     fcf_yield: Metric | None = None
     eps_growth_1y: float | None = None       # +0.06 = +6%
@@ -99,7 +101,7 @@ class QuickSnapshot:
 
     @property
     def has_fundamentals(self) -> bool:
-        return any(x is not None for x in (self.pe, self.ev_ebit, self.fcf_yield, self.fscore))
+        return any(x is not None for x in (self.pe, self.pe_now, self.ev_ebit, self.fcf_yield, self.fscore))
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -230,6 +232,20 @@ def quick_snapshot(ticker: str, engine, years: int = 10, as_of=None,
                 snap.eps_growth_1y = float(now.iloc[-1] / ago - 1)
     part("P/E", _pe)
 
+    # ── no EPS-based P/E (V, BRK-B, HSY…: EPS per share class only) → net income / market cap ──
+    def _pe_mcap():
+        if snap.pe is not None or snap.yields.get("earnings_yield") is not None:
+            return
+        alt = EM.earnings_yield_from_mcap(ticker, engine, end=end)
+        if alt is None:
+            return
+        ey = alt["earnings_yield"]
+        snap.yields["earnings_yield"] = ey
+        snap.eps_negative = ey <= 0
+        if ey > 0:
+            snap.pe_now = 1 / ey
+    part("P/E κεφ.", _pe_mcap)
+
     # ── FCF yield, EV/EBIT, dividend, capex trend (one price download) ──
     def _fcf_ev():
         fcf = Y.fcf_history(ticker, engine, years=years, as_of=as_of)
@@ -334,7 +350,10 @@ def format_card(snap: QuickSnapshot, indent: str = "  ") -> list[str]:
 
     lines = []
     emoji, phrase = verdict(snap)
-    parts = [_metric_txt("P/E", snap.pe, ".0f"),
+    pe_txt = _metric_txt("P/E", snap.pe, ".0f")
+    if pe_txt is None and snap.pe_now is not None:
+        pe_txt = f"P/E ≈ {snap.pe_now:.0f} (χωρίς ιστορικό)"
+    parts = [pe_txt,
              _metric_txt("EV/EBIT", None if snap.financial else snap.ev_ebit, ".0f"),
              _metric_txt("FCF", None if snap.financial else snap.fcf_yield, ".1%")]
     lines.append(f"{indent}💰 {emoji} {phrase}   " + " · ".join(p for p in parts if p))

@@ -6,6 +6,7 @@ on GitHub Actions; the mail only READS the result.
 One row per company: its classification and three yields, the same numbers
 the card shows, turned upside down so that "higher = cheaper":
     earnings_yield = EPS TTM / price       (1 / P/E;    negative = losses)
+                     or, with no EPS at all, net income TTM / market cap (v0.1.8)
     ebit_yield     = EBIT TTM / EV         (1 / EV/EBIT)
     fcf_yield      = FCF TTM / market cap
 Example: P/E 20 → earnings_yield 5%. A loss-maker gets a negative yield and
@@ -20,6 +21,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
+from . import earnings_mcap as EM
 from . import ev as E
 from . import pe as P
 from . import yields as Y
@@ -61,6 +63,16 @@ def company_yields(ticker: str, engine, end: pd.Timestamp | None = None) -> dict
                 out["earnings_yield"] = _last(d, "earnings_yield", end)
     except Exception as e:
         notes.append(f"P/E: {type(e).__name__}")
+
+    # no EPS-based yield (V, BRK-B, HSY…: EPS per share class only) → net income / market cap
+    if out["earnings_yield"] is None:
+        try:
+            alt = EM.earnings_yield_from_mcap(ticker, engine, end=end)
+            if alt is not None:
+                out["earnings_yield"] = alt["earnings_yield"]
+                notes.append("E/P από κέρδη ÷ κεφαλαιοποίηση")
+        except Exception as e:
+            notes.append(f"E/P κεφ.: {type(e).__name__}")
 
     try:
         fcf = Y.fcf_history(ticker, engine, years=YEARS)
