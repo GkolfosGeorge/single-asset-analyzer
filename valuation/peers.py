@@ -102,6 +102,41 @@ INDUSTRY_GROUPS = {
 }
 
 
+# ── Which companies are "financial" (v0.1.9, Nov 2026) ─────────────────────
+# Financial = deposits, loans or insurance float ARE the business, so EV/EBIT,
+# FCF and cash conversion mean nothing; the card shows P/E only.
+# Before v0.1.9 this was guessed from missing tags ("no operating income AND no
+# capex"): in the peer table of 24/11 that caught only 21 of 96 Financial Services
+# companies (C, GS, SCHW, PGR, MET… were missed) and wrongly caught ADP, PSX, CAR,
+# ARE, CPT, MAC. Yahoo's industry decides now; the old test is only the fallback
+# for a company without an industry.
+FINANCIAL_INDUSTRIES = {
+    "Banks - Diversified", "Banks - Regional", "Capital Markets", "Mortgage Finance",
+    "Insurance - Life", "Insurance - Property & Casualty", "Insurance - Reinsurance",
+    "Insurance - Diversified", "Insurance - Specialty",
+    "Credit Services",                 # lenders (COF, AXP, SYF); payment networks are excluded below
+}
+NOT_FINANCIAL = {"V", "MA", "PYPL", "WU"}            # Credit Services, but networks, not lenders
+FINANCIAL_EXTRA = {"STT", "NTRS", "APO", "AMP", "PFG", "RJF"}  # Asset Management with a bank or insurer inside
+
+
+def is_financial(ticker: str, industry, fallback: bool = False) -> bool:
+    """
+    is_financial("C", "Banks - Diversified")          → True
+    is_financial("SPGI", "Financial Data & Stock Exchanges") → False
+    is_financial("V", "Credit Services")              → False (payment network)
+    is_financial("ADP", "Software - Application", fallback=True) → False (industry wins)
+    is_financial("XYZ", None, fallback=True)          → True  (no industry: old test)
+    """
+    if ticker in FINANCIAL_EXTRA:
+        return True
+    if ticker in NOT_FINANCIAL:
+        return False
+    if isinstance(industry, str) and industry:
+        return industry in FINANCIAL_INDUSTRIES
+    return bool(fallback)
+
+
 def peer_groups(classification: dict[str, dict], min_peers: int = MIN_PEERS) -> pd.DataFrame:
     """
     {ticker: {"sector", "industry"}} → one row per ticker: level, group, size.

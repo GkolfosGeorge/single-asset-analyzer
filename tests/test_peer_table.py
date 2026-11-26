@@ -50,7 +50,7 @@ def test_a_bank_is_marked_and_one_failing_part_doesnt_stop_the_rest(monkeypatch)
 
 def test_build_and_coverage(monkeypatch):
     vals = {"A": 0.05, "B": None}
-    monkeypatch.setattr(T, "company_yields", lambda t, e, end: {
+    monkeypatch.setattr(T, "company_yields", lambda t, e, end, industry=None: {
         "earnings_yield": vals[t], "ebit_yield": None, "fcf_yield": None, "financial": False, "note": ""})
     t = T.build(None, ["A", "B"], {"A": {"sector": "Technology", "industry": "Semiconductors"}}, END,
                 progress_every=0)

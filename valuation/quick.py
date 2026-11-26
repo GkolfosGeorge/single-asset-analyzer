@@ -47,6 +47,7 @@ F_GROUPS = [
     ("Χρέος/ρευστότητα", ["leverage_decreased", "current_ratio_improved", "no_dilution"]),
     ("Αποδοτικότητα", ["gross_margin_improved", "asset_turnover_improved"]),
 ]
+CASH_FLOW_CRITERIA = {"positive_cfo", "cfo_exceeds_net_income"}   # meaningless for banks/insurers (v0.1.9)
 F_PASS = {   # what a ✓ means (legend)
     "positive_roa": "κερδοφόρα", "positive_cfo": "θετικές ταμειακές ροές",
     "roa_improved": "ROA ↑", "cfo_exceeds_net_income": "ταμείο > λογιστικά κέρδη",
@@ -264,12 +265,19 @@ def quick_snapshot(ticker: str, engine, years: int = 10, as_of=None,
         if not ev.daily.empty:
             snap.ev_ebit = _own_metric(ev.daily["ev_ebit"], lower_is_cheaper=True)
             snap.yields["ebit_yield"] = _last_yield(ev.daily, "ebit_yield", end)
-        # Banks/insurers have NEITHER operating income NOR capex. "No EBIT" alone
-        # is not enough: oil majors (CVX, XOM) don't report an operating-income
-        # line either, but they do have capex.
+        # old test (banks/insurers have neither operating income nor capex): only
+        # the fallback for a company without an industry, see below
         snap.financial = (ev.status.startswith("χωρίς EBIT")
                           and fcf.status.startswith("χωρίς capex"))
     part("FCF/EV", _fcf_ev)
+
+    # ── financial? Yahoo industry from the weekly table (peers.is_financial, v0.1.9) ──
+    def _financial():
+        t = load_peer_table()
+        row = t[t["ticker"] == ticker]
+        industry = row["industry"].iloc[0] if len(row) else None
+        snap.financial = PEERS.is_financial(ticker, industry, snap.financial)
+    part("χρηματοοικονομική", _financial)
 
     # ── Piotroski ──
     def _fscore():
@@ -303,6 +311,8 @@ def verdict(snap: QuickSnapshot) -> tuple[str, str]:
     cands = (snap.pe,) if snap.financial else (snap.pe, snap.ev_ebit, snap.fcf_yield)
     ms = [m for m in cands if m is not None]
     if not ms:
+        if snap.pe_now is not None:          # V, BRK-B: P/E of today, no history to compare with
+            return "⚪", "Χωρίς ιστορικό για σύγκριση"
         return "⚪", "Αποτίμηση μη διαθέσιμη"
     # Disagreement is the most informative case (e.g. MSFT 2026: P/E and
     # EV/EBIT normal, FCF yield the most expensive in 10 years) — so
@@ -390,6 +400,23 @@ def format_card(snap: QuickSnapshot, indent: str = "  ") -> list[str]:
     return lines
 
 
+def _health(snap: QuickSnapshot) -> tuple[int, int, dict]:
+    """
+    (score, max, detail) as the card shows them. For banks/insurers the two
+    cash-flow criteria are "–" (not judged) and don't count (v0.1.9):
+    JPM ✓✗✗✗ 2/7 → ✓–✗– 1/5. The Piotroski computation itself is untouched.
+    """
+    score, mx = snap.fscore
+    det = dict(snap.fscore_detail)
+    if snap.financial:
+        for k in CASH_FLOW_CRITERIA:
+            if det.get(k) is not None:
+                score -= det[k] is True
+                mx -= 1
+                det[k] = None
+    return int(score), int(mx), det
+
+
 def _health_lines(snap: QuickSnapshot, indent: str) -> list[str]:
     """
     🩺 Υγεία 5/9   Κερδοφορία ✓✓✓✗ · Χρέος/ρευστότητα ✓✗✗ · Αποδοτικότητα ✓✗
@@ -401,17 +428,19 @@ def _health_lines(snap: QuickSnapshot, indent: str) -> list[str]:
     """
     if not snap.fscore:
         return []
+    # banks/insurers: cash flow is deposits and claims, not business cash → no 🚩, ✗ or points for it
+    skip = CASH_FLOW_CRITERIA if snap.financial else set()
     sym = {True: "✓", False: "✗", None: "–"}
-    det = snap.fscore_detail
+    score, mx, det = _health(snap)
     groups = " · ".join(f"{name} " + "".join(sym[det.get(k)] for k in keys) for name, keys in F_GROUPS)
-    out = [f"{indent}🩺 Υγεία {snap.fscore[0]}/{snap.fscore[1]}   {groups}"]
+    out = [f"{indent}🩺 Υγεία {score}/{mx}   {groups}"]
     flags = [(k, t) for k, t in snap.fscore_flags
-             if not (k == "positive_roa" and snap.eps_negative)]
+             if not (k == "positive_roa" and snap.eps_negative) and k not in skip]
     if flags:
         out.append(f"{indent}   🚩 " + " · ".join(t for _, t in flags))
     flagged = {k for k, _ in snap.fscore_flags}
     fails = [F_FAIL[k] for _, keys in F_GROUPS for k in keys
-             if det.get(k) is False and k not in flagged]
+             if det.get(k) is False and k not in flagged and k not in skip]
     if fails:
         out.append(f"{indent}   ✗ " + " · ".join(fails))
     return out
@@ -424,7 +453,8 @@ def format_line(snap: QuickSnapshot, indent: str = "  ") -> list[str]:
     emoji, phrase = verdict(snap)
     bits = [f"{emoji} {phrase.split(' για')[0].lower()}"]
     if snap.fscore:
-        bits.append(f"Υγεία {snap.fscore[0]}/{snap.fscore[1]}")
+        score, mx, _ = _health(snap)
+        bits.append(f"Υγεία {score}/{mx}")
     if snap.days_to_earnings is not None and snap.days_to_earnings <= EARNINGS_SOON_DAYS:
         bits.append(f"⚠️ αποτελέσματα {_when(snap.days_to_earnings)}")
     return [f"{indent}📊 " + " · ".join(bits)]

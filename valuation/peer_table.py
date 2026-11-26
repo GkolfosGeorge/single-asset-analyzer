@@ -24,6 +24,7 @@ import pandas as pd
 from . import earnings_mcap as EM
 from . import ev as E
 from . import pe as P
+from . import peers as PEERS
 from . import yields as Y
 from .ttm import load_prices
 
@@ -43,8 +44,9 @@ def _last(d: pd.DataFrame, col: str, end: pd.Timestamp):
     return float(s.iloc[-1])
 
 
-def company_yields(ticker: str, engine, end: pd.Timestamp | None = None) -> dict:
-    """Today's three yields of one company (None where it can't be computed)."""
+def company_yields(ticker: str, engine, end: pd.Timestamp | None = None, industry=None) -> dict:
+    """Today's three yields of one company (None where it can't be computed).
+    `industry` (Yahoo) decides `financial` (peers.is_financial, v0.1.9)."""
     end = pd.Timestamp(end) if end is not None else pd.Timestamp(date.today())
     start = end - pd.DateOffset(years=YEARS)
     out = {"earnings_yield": None, "ebit_yield": None, "fcf_yield": None, "financial": False, "note": ""}
@@ -79,8 +81,9 @@ def company_yields(ticker: str, engine, end: pd.Timestamp | None = None) -> dict
         out["fcf_yield"] = _last(fcf.daily, "fcf_yield", end)
         ev = E.ev_history(ticker, engine, years=YEARS, base=fcf)
         out["ebit_yield"] = _last(ev.daily, "ebit_yield", end)
-        # same test as the card: banks/insurers have neither operating income nor capex
-        out["financial"] = bool(ev.status.startswith("χωρίς EBIT") and fcf.status.startswith("χωρίς capex"))
+        # same rule as the card: Yahoo industry; the old tag test only without an industry
+        out["financial"] = PEERS.is_financial(
+            ticker, industry, ev.status.startswith("χωρίς EBIT") and fcf.status.startswith("χωρίς capex"))
     except Exception as e:
         notes.append(f"FCF/EV: {type(e).__name__}")
 
@@ -96,7 +99,7 @@ def build(engine, tickers: list[str], classification: dict[str, dict],
         c = classification.get(t, {})
         rows.append({"ticker": t, "as_of": end.date().isoformat(),
                      "sector": c.get("sector"), "industry": c.get("industry"),
-                     **company_yields(t, engine, end)})
+                     **company_yields(t, engine, end, industry=c.get("industry"))})
         if progress_every and i % progress_every == 0:
             print(f"  ... {i}/{len(tickers)}", flush=True)
     return pd.DataFrame(rows, columns=COLUMNS)
